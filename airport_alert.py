@@ -256,18 +256,30 @@ def flight_reply(token, cid, code, num, date):
     return cards
 
 
+def flight_done(cards):
+    """Рейс выполнен: есть фактический прилёт или статус «прибыл» / «отменён»."""
+    for c in cards:
+        st = (c.get("status") or "").lower()
+        if (c["dir"] == "A" and c.get("actual")) or "прибыл" in st or "отмен" in st:
+            return True
+    return False
+
+
 def track_itinerary(token, cid, text, tracked, source="текст"):
     """Находит в тексте рейсы с датами, показывает их статус и ставит на слежение до прибытия."""
     today = now_utc().astimezone(MSK).date()
     found = F.parse_itinerary(text, today)
     if not found:
         return False
-    added = []
+    added, done = [], []
     for code, num, date in found[:8]:
         cards, _ = F.find_flight(code, num, date)
         if cards:
             cards.sort(key=lambda c: c["dir"] != "D")
             tg_api(token, "sendMessage", chat_id=cid, text="\n\n".join(F.format_card(c) for c in cards))
+            if flight_done(cards):
+                done.append(f"{code}{num} {date.strftime('%d.%m')}")
+                continue
         else:
             tg_api(token, "sendMessage", chat_id=cid,
                    text=f"✈️ {code}{num} {date.strftime('%d.%m.%Y')} — пока нет на табло, сообщу, когда появится "
@@ -276,9 +288,12 @@ def track_itinerary(token, cid, text, tracked, source="текст"):
         tracked.setdefault(cid, {})[key] = {"last": {c["airport"] + c["dir"]: F.snapshot(c) for c in cards},
                                             "added": now_utc().isoformat(), "source": source}
         added.append(f"{code}{num} {date.strftime('%d.%m')}")
-    tg_api(token, "sendMessage", chat_id=cid,
-           text="👀 Слежу до прибытия: " + ", ".join(added) + ".\nСообщу об изменениях времени, статуса, выхода и багажа. "
-                "/my — список, /untrack — отменить.")
+    msg = ""
+    if added:
+        msg += "👀 Слежу до прибытия: " + ", ".join(added) + ".\nСообщу об изменениях времени, статуса, выхода и багажа. /my — список, /untrack — отменить."
+    if done:
+        msg += ("\n\n" if msg else "") + "✔️ Уже выполнены, следить не нужно: " + ", ".join(done) + "."
+    tg_api(token, "sendMessage", chat_id=cid, text=msg)
     return True
 
 
@@ -330,6 +345,9 @@ def handle_command(token, cid, text, subs, tracked):
         code, num, date = pf
         date = date or now_utc().astimezone(MSK).date()
         cards = flight_reply(token, cid, code, num, date)
+        if cards and flight_done(cards):
+            tg_api(token, "sendMessage", chat_id=cid, text=f"✔️ {code}{num} {date.strftime('%d.%m')} уже выполнен — следить не нужно.")
+            return True
         if cards:
             key = f"{code}{num}|{date}"
             tracked.setdefault(cid, {})[key] = {"last": {c["airport"] + c["dir"]: F.snapshot(c) for c in cards},
@@ -422,7 +440,6 @@ def check_tracked(token):
                 continue
             if not cards:
                 continue
-            arrived = [c for c in cards if c["dir"] == "A" and c.get("actual")]
             changes = []
             appeared = []
             for c in cards:
@@ -449,8 +466,14 @@ def check_tracked(token):
                 if pos and pos.get("lat") is not None:
                     tg_api(token, "sendLocation", chat_id=cid, latitude=pos["lat"], longitude=pos["lon"])
                 sent.append(f"{cid}: {code}{num} — {'; '.join(changes)}")
-            if arrived and any("прибыл" in (c.get("status") or "").lower() for c in cards):
-                # рейс завершён — снимаем с отслеживания после сообщения о прибытии
+            if flight_done(cards):
+                # рейс завершён — сообщаем и снимаем с отслеживания
+                fin = [c for c in cards if c["dir"] == "A" and c.get("actual")] or cards
+                tg_api(token, "sendMessage", chat_id=cid,
+                       text=f"✅ {code}{num} {date.strftime('%d.%m')} выполнен: {fin[0].get('status') or 'прибыл'}"
+                            + (f" в {fin[0]['actual'][11:16]}" if fin[0].get("actual") and fin[0]["dir"] == "A" else "")
+                            + ". Снимаю с наблюдения.")
+                sent.append(f"{cid}: {code}{num} выполнен")
                 items.pop(key, None)
         if not items:
             tracked.pop(cid, None)
