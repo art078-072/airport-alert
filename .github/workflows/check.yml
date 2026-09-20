@@ -1,0 +1,56 @@
+name: airport-alert
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # каждые 10 минут (GitHub может задерживать запуск на несколько минут)
+  workflow_dispatch:          # кнопка «Run workflow» для ручного запуска
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: airport-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Состояние (подписчики и статусы аэропортов) живёт в кэше Actions, а не в репозитории.
+      # Каждый запуск сохраняет новую версию, следующий восстанавливает самую свежую по префиксу.
+      - name: Восстановить состояние
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            subscribers.json
+            airport_state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Проверка аэропортов и рассылка
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python3 airport_alert.py
+
+      - name: Сохранить состояние
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            subscribers.json
+            airport_state.json
+          key: state-${{ github.run_id }}
+
+      # Чистим старые версии кэша, оставляя 20 последних
+      - name: Убрать старые версии состояния
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key state- --limit 200 --json id,createdAt --order asc \
+            | python3 -c 'import json,sys; ids=[c["id"] for c in json.load(sys.stdin)]; print("\n".join(str(i) for i in ids[:-20]))' \
+            | while read id; do [ -n "$id" ] && gh cache delete "$id" --repo "$GITHUB_REPOSITORY" || true; done

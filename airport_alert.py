@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""Монитор аэропортов Шереметьево, Внуково и Пулково.
+
+Два типа событий:
+  1. Закрытие / открытие — «временные ограничения на приём и выпуск воздушных судов»
+     (обычно план «Ковёр» из-за атак беспилотников). Источник — официальные Telegram-каналы
+     аэропортов (@svo_online, @vnukovoairport_VKO, @pulkovo_led), Росавиации (@favt_ru, @korenyako)
+     и Аэрофлота (@aeroflot), читаются через публичные веб-превью t.me/s/<канал>.
+  2. Массовые задержки — более DELAY_LIMIT вылетов задержаны на DELAY_MIN минут и больше.
+  Сообщение отправляется один раз при изменении состояния (повторы отключены, REMIND_MIN = 0).
+     Источник — онлайн-табло svo.aero и pulkovoairport.ru (JSON). Табло Внуково защищено
+     от автоматического чтения, поэтому задержки по Внуково не отслеживаются.
+
+Состояние хранится рядом со скриптом; при изменении рассылает сообщение подписчикам
+Telegram-бота (и SMS через sms.ru, если настроен). Печатает JSON-отчёт.
+"""
+import html, json, os, re, sys, urllib.error, urllib.parse, urllib.request
+from datetime import datetime, timedelta, timezone
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(HERE, "airport_state.json")
+SUBS_FILE = os.path.join(HERE, "subscribers.json")   # {"offset": N, "chats": {"<id>": {"since": ...}}}
+TG_CONFIG = os.path.join(HERE, "tg_config.json")     # {"bot_token": "...", "chat_id": "..."}
+SMS_CONFIG = os.path.join(HERE, "sms_config.json")   # {"api_id": "...", "to": "79XXXXXXXXX"}
+
+MSK = timezone(timedelta(hours=3))
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"}
+
+# --- Закрытия -------------------------------------------------------------------------
+CHANNELS = ["svo_online", "vnukovoairport_VKO", "pulkovo_led", "favt_ru", "korenyako", "aeroflot"]
+AIRPORTS = ["Шереметьево", "Внуково", "Пулково"]
+# Как аэропорт может упоминаться в тексте (в любом падеже)
+MENTION = {
+    "Шереметьево": r"Шереметьев|московск\w+ авиа\w* узл|московских аэропорт|аэропортах Москвы",
+    "Внуково": r"Внуков|московск\w+ авиа\w* узл|московских аэропорт|аэропортах Москвы",
+    "Пулково": r"Пулков",
+}
+CLOSE_RE = re.compile(
+    r"введен\w*\s+(временн\w+\s+)?ограничен|ограничен\w+\s+(на\s+)?(при[её]м|вылет|использован)"
+    r"|прекрати\w+\s+при[её]м|закрыт\w*\s+(на\s+)?при[её]м|не\s+принимает|приостановл\w+\s+(при[её]м|полёт|полет)"
+    r"|продолжа\w+\s+(действ\w+\s+)?(временн\w+\s+)?ограничен|действи\w+\s+(временн\w+\s+)?ограничен|ещ[её]\s+закрыт"
+    r"|сигнал\w*\s+[«\"]?ков[её]р", re.I)
+OPEN_RE = re.compile(
+    r"снят\w*\s+(введ\w+\s+ранее\s+)?(временн\w+\s+)?ограничен|ограничен\w+\s+(\S+\s+){0,4}снят"
+    r"|работает\s+(без\s+ограничений|в\s+штатном\s+режиме|штатно)|возобнов\w+\s+(при[её]м|работ|полёт|полет|выполнен)", re.I)
+# Обороты про будущее снятие («после снятия ограничений») не считаем открытием
+FUTURE_RE = re.compile(r"(после|до|в\s+случае|при)\s+снят\w+\s+(временн\w+\s+)?ограничен\w*", re.I)
+
+# --- Задержки -------------------------------------------------------------------------
+DELAY_MIN = 60        # задержка от ... минут
+DELAY_LIMIT = 5       # тревога, если задержанных рейсов БОЛЬШЕ этого числа
+DELAY_CLEAR = 3       # отбой, когда задержанных стало не больше этого числа (гистерезис от дребезга)
+WINDOW_BACK_H, WINDOW_FWD_H = 2, 6   # учитываем вылеты по расписанию от -2 ч до +6 ч от текущего момента
+REMIND_MIN = 0        # повторные напоминания каждые N минут, пока ситуация сохраняется; 0 = выключено
+                      # (по желанию пользователя: одно сообщение при закрытии, одно при открытии)
+
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def msk(iso):
+    try:
+        return datetime.fromisoformat(iso).astimezone(MSK).strftime("%d.%m %H:%M МСК")
+    except Exception:
+        return ""
+
+
+def http_get(url, timeout=30, headers=None):
+    req = urllib.request.Request(url, headers={**UA, **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+# ======================================================================================
+# Telegram-каналы: закрытия / открытия
+# ======================================================================================
+def parse_channel(page, channel):
+    out = []
+    for blk in re.findall(r'<div class="tgme_widget_message_wrap.*?(?=<div class="tgme_widget_message_wrap|$)', page, re.S):
+        t = re.search(r'<time datetime="([^"]+)"', blk)
+        m = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', blk, re.S)
+        link = re.search(r'data-post="([^"]+)"', blk)
+        if not (t and m):
+            continue
+        txt = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))).strip()
+        out.append({"time": t.group(1), "text": txt, "channel": channel,
+                    "url": f"https://t.me/{link.group(1)}" if link else ""})
+    return out
+
+
+def classify(text):
+    """'closed' / 'open' / None по тексту сообщения."""
+    t = FUTURE_RE.sub(" ", text)
+    if OPEN_RE.search(t):
+        return "open"
+    if CLOSE_RE.search(t):
+        return "closed"
+    return None
+
+
+def closure_status(posts):
+    status = {a: {"state": "open", "since": None, "source": None, "text": None} for a in AIRPORTS}
+    for p in sorted(posts, key=lambda p: p["time"]):
+        verdict = classify(p["text"])
+        if not verdict:
+            continue
+        for a in AIRPORTS:
+            if re.search(MENTION[a], p["text"]):
+                status[a] = {"state": verdict, "since": p["time"], "source": p["url"], "text": p["text"][:300]}
+    return status
+
+
+# ======================================================================================
+# Онлайн-табло: задержки вылетов
+# ======================================================================================
+def delayed_svo():
+    n = now_utc().astimezone(MSK)
+    d1 = (n - timedelta(hours=WINDOW_BACK_H)).strftime("%Y-%m-%dT%H:%M:00+03:00")
+    d2 = (n + timedelta(hours=WINDOW_FWD_H)).strftime("%Y-%m-%dT%H:%M:00+03:00")
+    url = ("https://www.svo.aero/bitrix/timetable/?direction=departure&dateStart=" + urllib.parse.quote(d1)
+           + "&dateEnd=" + urllib.parse.quote(d2) + "&perPage=1000&page=0&locale=ru")
+    items = json.loads(http_get(url)).get("items", [])
+    delayed, total = [], 0
+    for f in items:
+        std, est = f.get("t_st"), f.get("t_et") or f.get("t_at")
+        if not std:
+            continue
+        total += 1
+        if est and (datetime.fromisoformat(est) - datetime.fromisoformat(std)) >= timedelta(minutes=DELAY_MIN):
+            delayed.append(f"{f.get('co', {}).get('code', '')}{f.get('flt', '')} {std[11:16]}→{est[11:16]}")
+    return {"delayed": len(delayed), "total": total, "flights": delayed[:15]}
+
+
+def delayed_led():
+    n = now_utc().astimezone(MSK)
+    lo, hi = n - timedelta(hours=WINDOW_BACK_H), n + timedelta(hours=WINDOW_FWD_H)
+    rows = json.loads(http_get("https://pulkovoairport.ru/api/?col=300&type=departure",
+                               headers={"X-Requested-With": "XMLHttpRequest",
+                                        "Referer": "https://pulkovoairport.ru/passengers/departure/"}))
+    delayed, total = [], 0
+    for f in rows:
+        std, etd = f.get("OD_STD"), f.get("OD_ETD")
+        if not std:
+            continue
+        s = datetime.fromisoformat(std[:19]).replace(tzinfo=MSK)
+        if not (lo <= s <= hi):
+            continue
+        total += 1
+        if etd and (datetime.fromisoformat(etd[:19]).replace(tzinfo=MSK) - s) >= timedelta(minutes=DELAY_MIN):
+            delayed.append(f"{f.get('OD_FLIGHT_NUMBER', '').replace('  ', ' ')} {std[11:16]}→{etd[11:16]}")
+    return {"delayed": len(delayed), "total": total, "flights": delayed[:15]}
+
+
+DELAY_SOURCES = {"Шереметьево": delayed_svo, "Пулково": delayed_led}
+
+
+# ======================================================================================
+# Рассылка: Telegram-бот (подписчики) и SMS
+# ======================================================================================
+def tg_api(token, method, **params):
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}",
+                                 data=urllib.parse.urlencode(params).encode())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "description": e.read().decode("utf-8", "replace")[:300]}
+
+
+def tg_config():
+    cfg = {}
+    if os.path.exists(TG_CONFIG):
+        try:
+            cfg = json.load(open(TG_CONFIG, encoding="utf-8"))
+        except Exception:
+            cfg = {}
+    cfg.setdefault("bot_token", os.environ.get("TG_BOT_TOKEN"))
+    cfg.setdefault("chat_id", os.environ.get("TG_CHAT_ID"))
+    return cfg if cfg.get("bot_token") else None
+
+
+def load_subs():
+    subs = {"offset": 0, "chats": {}}
+    if os.path.exists(SUBS_FILE):
+        try:
+            subs.update(json.load(open(SUBS_FILE, encoding="utf-8")))
+        except Exception:
+            pass
+    # Начальные подписчики из переменной окружения (чтобы не терять их при переезде на другой сервер)
+    for cid in os.environ.get("TG_SEED_CHATS", "").replace(";", ",").split(","):
+        cid = cid.strip()
+        if cid and cid not in subs["chats"]:
+            subs["chats"][cid] = {"since": "seed"}
+    return subs
+
+
+def save_subs(subs):
+    new = json.dumps(subs, ensure_ascii=False, indent=2)
+    old = open(SUBS_FILE, encoding="utf-8").read() if os.path.exists(SUBS_FILE) else None
+    if new != old:
+        open(SUBS_FILE, "w", encoding="utf-8").write(new)
+
+
+WELCOME = ("✅ Вы подписаны на оповещения по аэропортам Шереметьево, Внуково и Пулково:\n"
+           "• закрытие / открытие (временные ограничения, обычно из-за атак беспилотников);\n"
+           f"• массовые задержки — больше {DELAY_LIMIT} вылетов задержаны на {DELAY_MIN} мин и дольше.\n"
+           "Сообщение приходит один раз при закрытии и один раз при открытии.\n"
+           "Отписаться: /stop")
+BYE = "Вы отписаны от оповещений. Подписаться снова: /start"
+
+
+def update_subscribers(token, subs):
+    """/start (или любое сообщение) — подписка, /stop — отписка."""
+    resp = tg_api(token, "getUpdates", offset=subs["offset"], timeout=0)
+    if not resp.get("ok"):
+        return
+    for u in resp.get("result", []):
+        subs["offset"] = max(subs["offset"], u["update_id"] + 1)
+        m = u.get("message") or {}
+        chat = m.get("chat") or {}
+        if chat.get("type") != "private":
+            continue
+        cid = str(chat["id"])
+        text = (m.get("text") or "").strip().lower()
+        if text.startswith("/stop"):
+            subs["chats"].pop(cid, None)
+            tg_api(token, "sendMessage", chat_id=cid, text=BYE)
+        elif cid not in subs["chats"]:
+            subs["chats"][cid] = {"since": now_utc().isoformat()}
+            tg_api(token, "sendMessage", chat_id=cid, text=WELCOME)
+        elif text.startswith("/start"):
+            tg_api(token, "sendMessage", chat_id=cid, text=WELCOME)
+    save_subs(subs)
+
+
+def send_telegram(text):
+    cfg = tg_config()
+    if not cfg:
+        return False, "нет tg_config.json / TG_BOT_TOKEN"
+    subs = load_subs()
+    chats = set(subs["chats"]) | ({str(cfg["chat_id"])} if cfg.get("chat_id") else set())
+    results = {}
+    for cid in sorted(chats):
+        resp = tg_api(cfg["bot_token"], "sendMessage", chat_id=cid, text=text)
+        results[cid] = "ok" if resp.get("ok") else resp.get("description", "error")
+        if not resp.get("ok") and "blocked" in str(resp.get("description", "")):
+            subs["chats"].pop(cid, None)   # пользователь заблокировал бота
+    save_subs(subs)
+    ok = any(v == "ok" for v in results.values())
+    return ok, f"доставлено {sum(v == 'ok' for v in results.values())}/{len(results)}"
+
+
+def send_sms(text):
+    if not os.path.exists(SMS_CONFIG):
+        return False, "нет sms_config.json"
+    cfg = json.load(open(SMS_CONFIG, encoding="utf-8"))
+    if not cfg.get("api_id") or not cfg.get("to") or "XXX" in str(cfg.get("to")):
+        return False, "sms_config.json не заполнен"
+    q = urllib.parse.urlencode({"api_id": cfg["api_id"], "to": cfg["to"], "msg": text.split("\n")[0][:300], "json": 1})
+    req = urllib.request.Request("https://sms.ru/sms/send", data=q.encode(), headers=UA)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        resp = json.loads(r.read().decode("utf-8", "replace"))
+    ok = resp.get("status") == "OK" and all(v.get("status") == "OK" for v in resp.get("sms", {}).values())
+    return ok, json.dumps(resp, ensure_ascii=False)[:200]
+
+
+# ======================================================================================
+def main():
+    errors, posts = [], []
+    cfg = tg_config()
+    if cfg:
+        try:
+            update_subscribers(cfg["bot_token"], load_subs())
+        except Exception as e:
+            errors.append(f"telegram subscribers: {e}")
+
+    for ch in CHANNELS:
+        try:
+            posts += parse_channel(http_get(f"https://t.me/s/{ch}"), ch)
+        except Exception as e:
+            errors.append(f"{ch}: {e}")
+    status = closure_status(posts)
+
+    delays = {}
+    for a, fn in DELAY_SOURCES.items():
+        try:
+            delays[a] = fn()
+        except Exception as e:
+            errors.append(f"табло {a}: {e}")
+
+    prev = {}
+    if os.path.exists(STATE_FILE):
+        try:
+            prev = json.load(open(STATE_FILE, encoding="utf-8"))
+        except Exception:
+            prev = {}
+    prev_status, prev_delay = prev.get("status", {}), prev.get("delay_alert", {})
+    reminded = dict(prev.get("reminded", {}))   # ключ "closed:<аэропорт>" / "delay:<аэропорт>" -> время последнего сообщения
+    now_iso = now_utc().isoformat()
+
+    def due(key):
+        """Пора ли напомнить: прошло REMIND_MIN минут с последнего сообщения по этому ключу."""
+        if not REMIND_MIN:
+            return False
+        last = reminded.get(key)
+        return not last or (now_utc() - datetime.fromisoformat(last)) >= timedelta(minutes=REMIND_MIN)
+
+    messages = []
+    # 1) закрытие / открытие
+    for a, cur in status.items():
+        old = prev_status.get(a, {}).get("state", "open")
+        if cur["state"] != old:
+            if cur["state"] == "closed":
+                line = f"🔴 ЗАКРЫТ: {a} — введены ограничения на приём и выпуск ({msk(cur['since'])})"
+            else:
+                line = f"🟢 ОТКРЫТ: {a} — ограничения сняты ({msk(cur['since'])})"
+            if cur.get("source"):
+                line += f"\n{cur['source']}"
+            messages.append(line)
+            reminded[f"closed:{a}"] = now_iso
+        elif cur["state"] == "closed" and due(f"closed:{a}"):
+            hours = (now_utc() - datetime.fromisoformat(cur["since"])).total_seconds() / 3600 if cur.get("since") else 0
+            messages.append(f"🔴 НАПОМИНАНИЕ: {a} по-прежнему закрыт — ограничения действуют {hours:.1f} ч "
+                            f"(с {msk(cur['since'])})")
+            reminded[f"closed:{a}"] = now_iso
+        if cur["state"] == "open":
+            reminded.pop(f"closed:{a}", None)
+
+    # 2) массовые задержки (с гистерезисом)
+    delay_alert = dict(prev_delay)
+    stamp = now_utc().astimezone(MSK).strftime("%H:%M МСК")
+    for a, d in delays.items():
+        was = prev_delay.get(a, False)
+        if not was and d["delayed"] > DELAY_LIMIT:
+            delay_alert[a] = True
+            messages.append(f"🟠 ЗАДЕРЖКИ: {a} — {d['delayed']} вылетов задержаны на {DELAY_MIN} мин и дольше "
+                            f"(из {d['total']} ближайших, {stamp})\n" + ", ".join(d["flights"][:8]))
+            reminded[f"delay:{a}"] = now_iso
+        elif was and d["delayed"] <= DELAY_CLEAR:
+            delay_alert[a] = False
+            reminded.pop(f"delay:{a}", None)
+            messages.append(f"🟢 ЗАДЕРЖКИ СНЯТЫ: {a} — задержанных на {DELAY_MIN}+ мин: {d['delayed']} ({stamp})")
+        elif was and due(f"delay:{a}"):
+            messages.append(f"🟠 НАПОМИНАНИЕ: {a} — задержки продолжаются: {d['delayed']} вылетов на {DELAY_MIN}+ мин "
+                            f"(из {d['total']} ближайших, {stamp})\n" + ", ".join(d["flights"][:8]))
+            reminded[f"delay:{a}"] = now_iso
+
+    new_state = {"status": status, "delay_alert": delay_alert, "reminded": reminded}
+    if new_state != {"status": prev_status, "delay_alert": prev_delay, "reminded": prev.get("reminded", {})}:
+        json.dump({"updated_at": now_utc().isoformat(), **new_state},
+                  open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+    tg = sms = None
+    if messages:
+        text = "\n\n".join(messages)[:3500]
+        try:
+            ok, info = send_telegram(text)
+        except Exception as e:
+            ok, info = False, f"ошибка отправки: {e}"
+        tg = {"text": text, "sent": ok, "info": info}
+        if os.path.exists(SMS_CONFIG):
+            try:
+                ok, info = send_sms(text)
+            except Exception as e:
+                ok, info = False, f"ошибка отправки: {e}"
+            sms = {"sent": ok, "info": info}
+
+    print(json.dumps({
+        "checked_at": now_utc().isoformat(), "posts_scanned": len(posts), "errors": errors,
+        "status": {a: s["state"] for a, s in status.items()},
+        "delays": {a: {"delayed": d["delayed"], "total": d["total"]} for a, d in delays.items()},
+        "delay_alert": delay_alert, "changes": messages, "telegram": tg, "sms": sms,
+        "subscribers": len(load_subs()["chats"]),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
