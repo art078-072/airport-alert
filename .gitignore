@@ -4,3 +4,4 @@ subscribers.json
 airport_state.json
 __pycache__/
 .DS_Store
+tracked.json

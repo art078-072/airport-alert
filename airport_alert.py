@@ -17,11 +17,16 @@ Telegram-бота (и SMS через sms.ru, если настроен). Печ�
 import html, json, os, re, sys, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import flights as F   # статус конкретного рейса и положение самолёта
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(HERE, "airport_state.json")
 SUBS_FILE = os.path.join(HERE, "subscribers.json")   # {"offset": N, "chats": {"<id>": {"since": ...}}}
 TG_CONFIG = os.path.join(HERE, "tg_config.json")     # {"bot_token": "...", "chat_id": "..."}
 SMS_CONFIG = os.path.join(HERE, "sms_config.json")   # {"api_id": "...", "to": "79XXXXXXXXX"}
+POSITION_ENABLED = False   # положение самолёта по ADS-B (пока выключено по просьбе пользователя)
+TRACK_FILE = os.path.join(HERE, "tracked.json")      # {"<chat>": {"SU284|2026-09-21": {"last": {...}, "added": ...}}}
 
 MSK = timezone(timedelta(hours=3))
 UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"}
@@ -202,19 +207,108 @@ def save_subs(subs):
         open(SUBS_FILE, "w", encoding="utf-8").write(new)
 
 
+HELP = ("✈️ Отслеживание рейса:\n"
+        "• пришлите номер рейса — «SU284» или «SU284 21.09» — получите статус с табло "
+        "(время, задержка, терминал, выход, лента багажа);\n"
+        "• /track SU284 21.09 — следить за рейсом: сообщу об изменении времени, статуса, выхода;\n"
+        "• /my — мои рейсы, /untrack SU284 — перестать следить.\n"
+        "Табло: Шереметьево и Пулково (Внуково не даёт данных). Ответ приходит в течение ~10 минут.")
 WELCOME = ("✅ Вы подписаны на оповещения по аэропортам Шереметьево, Внуково и Пулково:\n"
            "• закрытие / открытие (временные ограничения, обычно из-за атак беспилотников);\n"
            f"• массовые задержки — больше {DELAY_LIMIT} вылетов задержаны на {DELAY_MIN} мин и дольше.\n"
            "Сообщение приходит один раз при закрытии и один раз при открытии.\n"
-           "Отписаться: /stop")
+           "Отписаться: /stop\n\n" + HELP)
 BYE = "Вы отписаны от оповещений. Подписаться снова: /start"
 
 
+def load_tracked():
+    if os.path.exists(TRACK_FILE):
+        try:
+            return json.load(open(TRACK_FILE, encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_tracked(tr):
+    new = json.dumps(tr, ensure_ascii=False, indent=2)
+    old = open(TRACK_FILE, encoding="utf-8").read() if os.path.exists(TRACK_FILE) else None
+    if new != old:
+        open(TRACK_FILE, "w", encoding="utf-8").write(new)
+
+
+def flight_reply(token, cid, code, num, date):
+    """Карточки рейса (+ точка на карте, если есть координаты). Возвращает найденные карточки."""
+    cards, errs = F.find_flight(code, num, date)
+    if not cards:
+        tg_api(token, "sendMessage", chat_id=cid,
+               text=f"Рейс {code}{num} на {date.strftime('%d.%m')} не найден на табло Шереметьево и Пулково.\n"
+                    "Проверьте номер и дату (например «SU284 21.09»). Пулково показывает только ближайшие сутки."
+                    + (f"\n⚠️ {'; '.join(errs)}" if errs else ""))
+        return []
+    cards.sort(key=lambda c: c["dir"] != "D")
+    pos = F.position(code, num) if POSITION_ENABLED and any(F.in_air(c) for c in cards) else None
+    text = "\n\n".join(F.format_card(c, pos if i == 0 else None) for i, c in enumerate(cards))
+    tg_api(token, "sendMessage", chat_id=cid, text=text)
+    if pos and pos.get("lat") is not None:
+        tg_api(token, "sendLocation", chat_id=cid, latitude=pos["lat"], longitude=pos["lon"])
+    return cards
+
+
+def handle_command(token, cid, text, subs, tracked):
+    """Команды бота. Возвращает True, если что-то сделано."""
+    t = text.strip()
+    low = t.lower()
+    if low.startswith("/help"):
+        tg_api(token, "sendMessage", chat_id=cid, text=HELP)
+        return True
+    if low.startswith("/my"):
+        mine = tracked.get(cid, {})
+        tg_api(token, "sendMessage", chat_id=cid,
+               text=("Слежу за рейсами:\n" + "\n".join(f"• {k.split('|')[0]} {k.split('|')[1][8:10]}.{k.split('|')[1][5:7]}" for k in mine))
+               if mine else "Вы пока не следите ни за одним рейсом. Пример: /track SU284 21.09")
+        return True
+    if low.startswith("/untrack"):
+        arg = t[8:].strip()
+        mine = tracked.get(cid, {})
+        if not arg:
+            tracked.pop(cid, None)
+            tg_api(token, "sendMessage", chat_id=cid, text="Перестал следить за всеми рейсами.")
+            return True
+        pf = F.parse_flight(arg)
+        keys = [k for k in mine if pf and k.startswith(f"{pf[0]}{pf[1]}|")]
+        for k in keys:
+            mine.pop(k, None)
+        tg_api(token, "sendMessage", chat_id=cid, text="Перестал следить." if keys else "Такого рейса в списке нет. /my — список.")
+        return True
+    if low.startswith("/track"):
+        pf = F.parse_flight(t[6:].strip())
+        if not pf:
+            tg_api(token, "sendMessage", chat_id=cid, text="Формат: /track SU284 21.09 (дата — необязательно, по умолчанию сегодня)")
+            return True
+        code, num, date = pf
+        date = date or now_utc().astimezone(MSK).date()
+        cards = flight_reply(token, cid, code, num, date)
+        if cards:
+            key = f"{code}{num}|{date}"
+            tracked.setdefault(cid, {})[key] = {"last": {c["airport"] + c["dir"]: F.snapshot(c) for c in cards},
+                                                "added": now_utc().isoformat()}
+            tg_api(token, "sendMessage", chat_id=cid, text=f"👀 Слежу за {code}{num} {date.strftime('%d.%m')}: сообщу об изменениях времени, статуса, выхода и багажа. /untrack {code}{num} — отменить.")
+        return True
+    pf = F.parse_flight(t)
+    if pf:
+        code, num, date = pf
+        flight_reply(token, cid, code, num, date or now_utc().astimezone(MSK).date())
+        return True
+    return False
+
+
 def update_subscribers(token, subs):
-    """/start (или любое сообщение) — подписка, /stop — отписка."""
+    """/start (или любое сообщение) — подписка, /stop — отписка, остальное — команды по рейсам."""
     resp = tg_api(token, "getUpdates", offset=subs["offset"], timeout=0)
     if not resp.get("ok"):
         return
+    tracked = load_tracked()
     for u in resp.get("result", []):
         subs["offset"] = max(subs["offset"], u["update_id"] + 1)
         m = u.get("message") or {}
@@ -222,16 +316,77 @@ def update_subscribers(token, subs):
         if chat.get("type") != "private":
             continue
         cid = str(chat["id"])
-        text = (m.get("text") or "").strip().lower()
-        if text.startswith("/stop"):
+        text = (m.get("text") or "").strip()
+        low = text.lower()
+        if low.startswith("/stop"):
             subs["chats"].pop(cid, None)
+            tracked.pop(cid, None)
             tg_api(token, "sendMessage", chat_id=cid, text=BYE)
-        elif cid not in subs["chats"]:
+            continue
+        if cid not in subs["chats"]:
             subs["chats"][cid] = {"since": now_utc().isoformat()}
             tg_api(token, "sendMessage", chat_id=cid, text=WELCOME)
-        elif text.startswith("/start"):
+            if low.startswith("/start"):
+                continue
+        elif low.startswith("/start"):
             tg_api(token, "sendMessage", chat_id=cid, text=WELCOME)
+            continue
+        try:
+            if not handle_command(token, cid, text, subs, tracked):
+                tg_api(token, "sendMessage", chat_id=cid, text="Не понял. " + HELP)
+        except Exception as e:
+            tg_api(token, "sendMessage", chat_id=cid, text=f"Не удалось получить данные: {e}")
+    save_tracked(tracked)
     save_subs(subs)
+
+
+def check_tracked(token):
+    """Проверяет отслеживаемые рейсы и сообщает об изменениях. Возвращает список отправленных строк."""
+    tracked = load_tracked()
+    sent = []
+    now = now_utc()
+    for cid, items in list(tracked.items()):
+        for key, item in list(items.items()):
+            code_num, date_s = key.split("|")
+            code, num = code_num[:2], code_num[2:]
+            date = datetime.fromisoformat(date_s).date()
+            # срок: сутки после даты рейса или час после фактического прилёта
+            if now.astimezone(MSK).date() > date + timedelta(days=1):
+                items.pop(key)
+                continue
+            try:
+                cards, _ = F.find_flight(code, num, date)
+            except Exception:
+                continue
+            if not cards:
+                continue
+            arrived = [c for c in cards if c["dir"] == "A" and c.get("actual")]
+            changes = []
+            for c in cards:
+                k = c["airport"] + c["dir"]
+                old = item["last"].get(k, {})
+                new = F.snapshot(c)
+                if old and new != old:
+                    diff = F.describe_change(old, new, c)
+                    if diff:
+                        changes.append(f"{'Вылет' if c['dir'] == 'D' else 'Прилёт'} ({c['airport']}): {diff}")
+                item["last"][k] = new
+            if changes:
+                pos = F.position(code, num) if POSITION_ENABLED and any(F.in_air(c) for c in cards) else None
+                text = f"🔔 {code}{num} {date.strftime('%d.%m')}\n" + "\n".join(changes)
+                if pos and not pos.get("on_ground") and pos.get("alt_m") is not None:
+                    text += f"\n🛰 Сейчас: высота {pos['alt_m']} м" + (f", скорость {pos['speed_kmh']} км/ч" if pos.get("speed_kmh") else "")
+                tg_api(token, "sendMessage", chat_id=cid, text=text)
+                if pos and pos.get("lat") is not None:
+                    tg_api(token, "sendLocation", chat_id=cid, latitude=pos["lat"], longitude=pos["lon"])
+                sent.append(f"{cid}: {code}{num} — {'; '.join(changes)}")
+            if arrived and any("прибыл" in (c.get("status") or "").lower() for c in cards):
+                # рейс завершён — снимаем с отслеживания после сообщения о прибытии
+                items.pop(key, None)
+        if not items:
+            tracked.pop(cid, None)
+    save_tracked(tracked)
+    return sent
 
 
 def send_telegram(text):
@@ -269,11 +424,16 @@ def send_sms(text):
 def main():
     errors, posts = [], []
     cfg = tg_config()
+    tracked_sent = []
     if cfg:
         try:
             update_subscribers(cfg["bot_token"], load_subs())
         except Exception as e:
             errors.append(f"telegram subscribers: {e}")
+        try:
+            tracked_sent = check_tracked(cfg["bot_token"])
+        except Exception as e:
+            errors.append(f"tracked flights: {e}")
 
     for ch in CHANNELS:
         try:
@@ -372,6 +532,7 @@ def main():
         "delays": {a: {"delayed": d["delayed"], "total": d["total"]} for a, d in delays.items()},
         "delay_alert": delay_alert, "changes": messages, "telegram": tg, "sms": sms,
         "subscribers": len(load_subs()["chats"]),
+        "tracked": sum(len(v) for v in load_tracked().values()), "tracked_sent": tracked_sent,
     }, ensure_ascii=False, indent=2))
     return 0
 

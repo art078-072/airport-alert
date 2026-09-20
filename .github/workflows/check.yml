@@ -27,6 +27,7 @@ jobs:
           path: |
             subscribers.json
             airport_state.json
+            tracked.json
           key: state-${{ github.run_id }}
           restore-keys: state-
 
@@ -44,6 +45,7 @@ jobs:
           path: |
             subscribers.json
             airport_state.json
+            tracked.json
           key: state-${{ github.run_id }}
 
       # Чистим старые версии кэша, оставляя 20 последних
