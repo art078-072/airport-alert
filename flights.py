@@ -219,3 +219,60 @@ def describe_change(old, new, card):
             else:
                 parts.append(f"{n}: {a or '—'} → {b}")
     return "; ".join(parts)
+
+
+# ---------------------------------------------------------------------------------------
+# Разбор пересланного бронирования (письмо/маршрут-квитанция): номера рейсов + даты
+# ---------------------------------------------------------------------------------------
+MONTHS = {"янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "май": 5, "июн": 6, "июл": 7, "авг": 8, "сен": 9,
+          "окт": 10, "ноя": 11, "дек": 12, "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7,
+          "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+FLIGHT_RE = re.compile(r"(?<![A-Z0-9])([A-Z][A-Z0-9]|[0-9][A-Z])\s?-?\s?(\d{2,4})(?![0-9])")
+DATE_RE = re.compile(r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})|(\d{1,2})\s+([а-яА-Яa-zA-Z]{3,8})\.?\s*(\d{4})?")
+# слова, после которых двухбуквенные сочетания — не авиакомпании (терминал, выход, ряд и т.п.)
+NOISE = {"PNR", "ID", "NO", "ОК", "OK", "RU", "EN", "UP", "GB", "US", "KG", "PC", "PS"}
+
+
+def _parse_date(m, year_hint):
+    if m.group(1):
+        d, mo, y = int(m.group(1)), int(m.group(2)), m.group(3)
+        y = int(y) + 2000 if len(y) == 2 else int(y)
+    else:
+        d, mon, y = int(m.group(4)), m.group(5).lower()[:3], m.group(6)
+        if mon not in MONTHS:
+            return None
+        mo, y = MONTHS[mon], int(y) if y else year_hint
+    try:
+        return datetime(y, mo, d).date()
+    except ValueError:
+        return None
+
+
+def parse_itinerary(text, today):
+    """Находит пары (рейс, дата) в свободном тексте: каждому рейсу — ближайшая по тексту дата.
+    Возвращает список (code, num, date), без дублей, только даты не раньше вчера."""
+    up = text.upper()
+    dates = [(m.start(), _parse_date(m, today.year)) for m in DATE_RE.finditer(text)]
+    dates = [(p, d) for p, d in dates if d]
+    out, seen = [], set()
+    for m in FLIGHT_RE.finditer(up):
+        code, num = m.group(1), m.group(2).lstrip("0")
+        if code in NOISE or not num or code.isdigit():
+            continue
+        # только известные авиакомпании либо код с цифрой (U6, S7, 5N ...) — чтобы не ловить «ряд 12» и т.п.
+        if code not in ICAO and not re.search(r"\d", code):
+            continue
+        if not dates:
+            continue
+        pos = m.start()
+        # ближайшая дата после рейса в пределах 300 символов, иначе ближайшая до
+        after = [(p - pos, d) for p, d in dates if p >= pos and p - pos < 300]
+        before = [(pos - p, d) for p, d in dates if p < pos]
+        cand = min(after)[1] if after else (min(before)[1] if before else None)
+        if not cand or cand < today - timedelta(days=1):
+            continue
+        key = (code, num, cand)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out

@@ -211,7 +211,8 @@ HELP = ("✈️ Отслеживание рейса:\n"
         "• пришлите номер рейса — «SU284» или «SU284 21.09» — получите статус с табло "
         "(время, задержка, терминал, выход, лента багажа);\n"
         "• /track SU284 21.09 — следить за рейсом: сообщу об изменении времени, статуса, выхода;\n"
-        "• /my — мои рейсы, /untrack SU284 — перестать следить.\n"
+        "• /my — мои рейсы, /untrack SU284 — перестать следить;\n"
+        "• пришлите билет PDF или перешлите письмо с бронированием — поставлю все рейсы на слежение до прибытия.\n"
         "Табло: Шереметьево и Пулково (Внуково не даёт данных). Ответ приходит в течение ~10 минут.")
 WELCOME = ("✅ Вы подписаны на оповещения по аэропортам Шереметьево, Внуково и Пулково:\n"
            "• закрытие / открытие (временные ограничения, обычно из-за атак беспилотников);\n"
@@ -253,6 +254,46 @@ def flight_reply(token, cid, code, num, date):
     if pos and pos.get("lat") is not None:
         tg_api(token, "sendLocation", chat_id=cid, latitude=pos["lat"], longitude=pos["lon"])
     return cards
+
+
+def track_itinerary(token, cid, text, tracked, source="текст"):
+    """Находит в тексте рейсы с датами, показывает их статус и ставит на слежение до прибытия."""
+    today = now_utc().astimezone(MSK).date()
+    found = F.parse_itinerary(text, today)
+    if not found:
+        return False
+    added = []
+    for code, num, date in found[:8]:
+        cards, _ = F.find_flight(code, num, date)
+        if cards:
+            cards.sort(key=lambda c: c["dir"] != "D")
+            tg_api(token, "sendMessage", chat_id=cid, text="\n\n".join(F.format_card(c) for c in cards))
+        else:
+            tg_api(token, "sendMessage", chat_id=cid,
+                   text=f"✈️ {code}{num} {date.strftime('%d.%m.%Y')} — пока нет на табло, сообщу, когда появится "
+                        "(Шереметьево публикует рейсы заранее, Пулково — за сутки).")
+        key = f"{code}{num}|{date}"
+        tracked.setdefault(cid, {})[key] = {"last": {c["airport"] + c["dir"]: F.snapshot(c) for c in cards},
+                                            "added": now_utc().isoformat(), "source": source}
+        added.append(f"{code}{num} {date.strftime('%d.%m')}")
+    tg_api(token, "sendMessage", chat_id=cid,
+           text="👀 Слежу до прибытия: " + ", ".join(added) + ".\nСообщу об изменениях времени, статуса, выхода и багажа. "
+                "/my — список, /untrack — отменить.")
+    return True
+
+
+def pdf_text(token, file_id):
+    """Скачивает документ из Telegram и извлекает текст (PDF)."""
+    info = tg_api(token, "getFile", file_id=file_id)
+    if not info.get("ok"):
+        raise RuntimeError("не удалось получить файл из Telegram")
+    url = f"https://api.telegram.org/file/bot{token}/{info['result']['file_path']}"
+    with urllib.request.urlopen(url, timeout=60) as r:
+        data = r.read()
+    import io
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(data))
+    return "\n".join((page.extract_text() or "") for page in reader.pages)
 
 
 def handle_command(token, cid, text, subs, tracked):
@@ -300,6 +341,9 @@ def handle_command(token, cid, text, subs, tracked):
         code, num, date = pf
         flight_reply(token, cid, code, num, date or now_utc().astimezone(MSK).date())
         return True
+    # Пересланное бронирование / маршрут-квитанция / текст билета
+    if track_itinerary(token, cid, t, tracked):
+        return True
     return False
 
 
@@ -316,8 +360,26 @@ def update_subscribers(token, subs):
         if chat.get("type") != "private":
             continue
         cid = str(chat["id"])
-        text = (m.get("text") or "").strip()
+        text = (m.get("text") or m.get("caption") or "").strip()
         low = text.lower()
+        doc = m.get("document") or {}
+        if doc and (doc.get("mime_type") == "application/pdf" or str(doc.get("file_name", "")).lower().endswith(".pdf")):
+            if cid not in subs["chats"]:
+                subs["chats"][cid] = {"since": now_utc().isoformat()}
+            try:
+                if doc.get("file_size", 0) > 20 * 1024 * 1024:
+                    raise RuntimeError("файл больше 20 МБ")
+                txt = pdf_text(token, doc["file_id"])
+                if not txt.strip():
+                    raise RuntimeError("в PDF нет текстового слоя (скан?) — пришлите текст бронирования")
+                if not track_itinerary(token, cid, txt, tracked, source=doc.get("file_name", "pdf")):
+                    tg_api(token, "sendMessage", chat_id=cid, text="В PDF не нашёл рейсов с датами. Пришлите номер рейса и дату текстом, например «SU284 21.09».")
+            except Exception as e:
+                tg_api(token, "sendMessage", chat_id=cid, text=f"Не удалось разобрать PDF: {e}")
+            continue
+        if doc or m.get("photo"):
+            tg_api(token, "sendMessage", chat_id=cid, text="Принимаю билеты в PDF или текстом (перешлите письмо с бронированием). Фото пока не распознаю.")
+            continue
         if low.startswith("/stop"):
             subs["chats"].pop(cid, None)
             tracked.pop(cid, None)
@@ -362,15 +424,22 @@ def check_tracked(token):
                 continue
             arrived = [c for c in cards if c["dir"] == "A" and c.get("actual")]
             changes = []
+            appeared = []
             for c in cards:
                 k = c["airport"] + c["dir"]
                 old = item["last"].get(k, {})
                 new = F.snapshot(c)
-                if old and new != old:
+                if not old:
+                    appeared.append(c)
+                elif new != old:
                     diff = F.describe_change(old, new, c)
                     if diff:
                         changes.append(f"{'Вылет' if c['dir'] == 'D' else 'Прилёт'} ({c['airport']}): {diff}")
                 item["last"][k] = new
+            if appeared:
+                appeared.sort(key=lambda c: c["dir"] != "D")
+                tg_api(token, "sendMessage", chat_id=cid, text="📋 Рейс появился на табло:\n\n" + "\n\n".join(F.format_card(c) for c in appeared))
+                sent.append(f"{cid}: {code}{num} появился на табло")
             if changes:
                 pos = F.position(code, num) if POSITION_ENABLED and any(F.in_air(c) for c in cards) else None
                 text = f"🔔 {code}{num} {date.strftime('%d.%m')}\n" + "\n".join(changes)

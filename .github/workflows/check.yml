@@ -31,6 +31,9 @@ jobs:
           key: state-${{ github.run_id }}
           restore-keys: state-
 
+      - name: Зависимости
+        run: pip install -q pypdf
+
       - name: Проверка аэропортов и рассылка
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
