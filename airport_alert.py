@@ -186,7 +186,9 @@ def delayed_aer():
     return {"delayed": len(delayed), "total": total, "flights": delayed[:15], "fetch_s": F._AER_CACHE.get("today_time")}
 
 
-DELAY_SOURCES = {"Шереметьево": delayed_svo, "Пулково": delayed_led, "Сочи": delayed_aer}
+DELAY_SOURCES = {"Шереметьево": delayed_svo, "Пулково": delayed_led}
+if F.AER_AVAILABLE:
+    DELAY_SOURCES["Сочи"] = delayed_aer
 
 
 # ======================================================================================

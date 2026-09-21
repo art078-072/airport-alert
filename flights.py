@@ -4,7 +4,7 @@
 (pulkovoairport.ru, вылет/прилёт, ближайшие ~сутки); положение — ADS-B через api.adsb.lol
 (бесплатно, без ключа; над Россией покрытие неполное, поэтому координаты есть не всегда).
 """
-import json, re, urllib.parse, urllib.request
+import json, os, re, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
 
 MSK = timezone(timedelta(hours=3))
@@ -133,19 +133,30 @@ AER_ROW = re.compile(r'<a href="/flights/online-schedule/(\d+)/">\s*<div class="
 
 
 _AER_CACHE = {}   # страница тяжёлая и медленная — грузим не чаще одного раза за запуск на каждый день
+# aer.aero не отвечает зарубежным IP (в т.ч. серверам GitHub Actions): там табло Сочи недоступно.
+# Можно принудительно включить/выключить переменной AER_BOARD=1/0.
+AER_AVAILABLE = os.environ.get("AER_BOARD", "0" if os.environ.get("GITHUB_ACTIONS") else "1") == "1"
 
 
 def _aer_page(day):
+    if not AER_AVAILABLE:
+        raise RuntimeError("табло Сочи недоступно из этой сети (aer.aero блокирует зарубежные IP)")
     if day in _AER_CACHE:
         return _AER_CACHE[day]
+    if _AER_CACHE.get("failed"):
+        raise RuntimeError("aer.aero недоступен")
     url = f"https://aer.aero/flights/online-schedule/?day_departure={day}&day_arrival={day}"
     req = urllib.request.Request(url, headers={**UA, "Accept-Encoding": "gzip"})
     import gzip, time
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=150) as r:
-        data = r.read()
-        if r.headers.get("Content-Encoding") == "gzip":
-            data = gzip.decompress(data)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                data = gzip.decompress(data)
+    except Exception:
+        _AER_CACHE["failed"] = True   # не повторять попытки в этом запуске
+        raise
     _AER_CACHE[day] = data.decode("utf-8", "replace")
     _AER_CACHE[day + "_time"] = round(time.time() - t0, 1)
     return _AER_CACHE[day]
@@ -218,6 +229,8 @@ def aer_board(day="today"):
 
 
 def _aer(code, num, date):
+    if not AER_AVAILABLE:
+        return []
     today = datetime.now(MSK).date()
     days = {today - timedelta(days=1): "yesterday", today: "today", today + timedelta(days=1): "tomorrow"}
     if date not in days and not (today - timedelta(days=3) <= date <= today + timedelta(days=1)):
