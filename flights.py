@@ -47,8 +47,23 @@ def parse_flight(text):
     return code, num, date
 
 
-def _hm(iso):
-    return iso[11:16] if iso else "—"
+def _hm(iso, ref=None):
+    """ЧЧ:ММ; если дата отличается от ref (ISO) — с датой дд.мм."""
+    if not iso:
+        return "—"
+    if ref and iso[:10] != ref[:10]:
+        return f"{iso[8:10]}.{iso[5:7]} {iso[11:16]}"
+    return iso[11:16]
+
+
+def _delay_text(minutes):
+    if minutes < 120:
+        return f"{minutes} мин"
+    h, m = divmod(minutes, 60)
+    if h < 48:
+        return f"{h} ч {m:02d} мин"
+    d, h = divmod(h, 24)
+    return f"{d} дн {h} ч"
 
 
 def _svo(code, num, date):
@@ -110,10 +125,100 @@ def _led(code, num, date):
     return out
 
 
+# ---------------------------------------------------------------------------------------
+# Сочи (aer.aero): табло отдаётся готовым HTML — вылеты и прилёты за вчера/сегодня/завтра
+# ---------------------------------------------------------------------------------------
+AER_ROW = re.compile(r'<a href="/flights/online-schedule/(\d+)/">\s*<div class="main-widget__content__item-block[^"]*"'
+                     r'((?:\s+data-[\w-]+="[^"]*")+)\s*(?:style="[^"]*")?>(.*?)</a>', re.S)
+
+
+def _aer_page(day):
+    url = f"https://aer.aero/flights/online-schedule/?day_departure={day}&day_arrival={day}"
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=40) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def _aer_dt(text, fallback_date):
+    """'19.09 17:35' / '17:35' / '' -> ISO-строка МСК или None."""
+    text = (text or "").strip()
+    m = re.match(r"(?:(\d{2})\.(\d{2})\s+)?(\d{2}):(\d{2})$", text)
+    if not m:
+        return None
+    d, mo, hh, mm = m.groups()
+    if d:
+        year = fallback_date.year
+        # переход через Новый год
+        if int(mo) == 12 and fallback_date.month == 1:
+            year -= 1
+        elif int(mo) == 1 and fallback_date.month == 12:
+            year += 1
+        base = datetime(year, int(mo), int(d))
+    else:
+        base = datetime(fallback_date.year, fallback_date.month, fallback_date.day)
+    return base.replace(hour=int(hh), minute=int(mm)).strftime("%Y-%m-%dT%H:%M:00+03:00")
+
+
+def parse_aer(page, page_date):
+    """Строки табло Сочи -> список карточек (dir D/A)."""
+    out = []
+    dep_at, arr_at = page.find('class="departure-cont"'), page.find('class="arrival-cont"')
+    for m in AER_ROW.finditer(page):
+        attrs = dict(re.findall(r'data-([\w-]+)="([^"]*)"', m.group(2)))
+        body = m.group(3)
+        is_dep = arr_at < 0 or m.start() < arr_at
+        sched_txt = re.search(r'main-widget__discount">([^<]*)<', body)
+        act = re.search(r'main-widget__discount-sum">\s*(?:<span>([^<]*)</span>)?\s*([^<]*)<', body)
+        sched = _aer_dt(sched_txt.group(1), page_date) if sched_txt else \
+            _aer_dt(f"{attrs.get('time', '00')}:{attrs.get('time-minute', '00')}", page_date)
+        est = None
+        if act:
+            est = _aer_dt(((act.group(1) or "").strip() + " " + act.group(2).strip()).strip(), page_date)
+        flt = re.search(r'main-widget-td1__flight">.*?<span>\s*([A-Z0-9]{2})-?\s?(\d{1,4})\s*</span>', body, re.S)
+        if not flt:
+            continue
+        city = re.search(r'main-widget-td1--country bold">\s*(?:<span>)?([^<]+?)(?:</span>)?\s*<div', body)
+        comp = re.search(r'main-widget-td1__company show-1024-up">(?:\s*<img[^>]*>)?\s*([^<]*)<', body)
+        gate = re.search(r'main-widget__baggage">([^<]*)<', body)
+        status = attrs.get("status", "").strip()
+        actual = est if re.search(r"вылетел|прибыл|приземл", status, re.I) else None
+        city_s = (city.group(1).strip().title() if city else "?")
+        gate_s = (gate.group(1).strip() if gate else "")
+        out.append({
+            "airport": "Сочи", "iata_here": "AER", "dir": "D" if is_dep else "A",
+            "flight": f"{flt.group(1)}{flt.group(2).lstrip('0')}", "airline": comp.group(1).strip() if comp else flt.group(1),
+            "route": f"Сочи (AER) → {city_s}" if is_dep else f"{city_s} → Сочи (AER)",
+            "sched": sched, "est": est if est != sched else None, "actual": actual,
+            "status": status, "terminal": "", "gate": "" if gate_s in ("н/д", "") else gate_s, "belt": "",
+            "aircraft": "", "aer_id": m.group(1),
+        })
+    return out
+
+
+def aer_board(day="today"):
+    """Табло Сочи за день: 'yesterday' | 'today' | 'tomorrow'."""
+    today = datetime.now(MSK).date()
+    page_date = {"yesterday": today - timedelta(days=1), "today": today, "tomorrow": today + timedelta(days=1)}[day]
+    return parse_aer(_aer_page(day), page_date)
+
+
+def _aer(code, num, date):
+    today = datetime.now(MSK).date()
+    days = {today - timedelta(days=1): "yesterday", today: "today", today + timedelta(days=1): "tomorrow"}
+    if date not in days and not (today - timedelta(days=3) <= date <= today + timedelta(days=1)):
+        return []
+    def match(c):
+        return c["flight"] == f"{code}{num}" and str(date) in ((c["sched"] or "")[:10], (c["est"] or "")[:10], (c["actual"] or "")[:10])
+    found = [c for c in aer_board("today") if match(c)]
+    if not found and date in days and days[date] != "today":
+        found = [c for c in aer_board(days[date]) if match(c)]
+    return found
+
+
 def find_flight(code, num, date):
     """Все записи табло по рейсу на дату (может быть 2: вылет из одного аэропорта и прилёт в другой)."""
     found, errors = [], []
-    for fn in (_svo, _led):
+    for fn in (_svo, _led, _aer):
         try:
             found += fn(code, num, date)
         except Exception as e:
@@ -164,8 +269,8 @@ def format_card(card, pos=None):
     lines = [f"✈️ {d['flight']} — {d['airline']}" + (f", {d['aircraft']}" if d.get("aircraft") else ""),
              d["route"],
              f"📅 {date_h}, {'вылет' if d['dir'] == 'D' else 'прилёт'}: план {_hm(d.get('sched'))}"
-             + (f", расч. {_hm(d['est'])}" if d.get("est") and d["est"] != d.get("sched") else "")
-             + (f", факт {_hm(d['actual'])}" if d.get("actual") else "")]
+             + (f", расч. {_hm(d['est'], d.get('sched'))}" if d.get("est") and d["est"] != d.get("sched") else "")
+             + (f", факт {_hm(d['actual'], d.get('sched'))}" if d.get("actual") else "")]
     delay = None
     ref = d.get("actual") or d.get("est")
     if ref and d.get("sched"):
@@ -175,7 +280,7 @@ def format_card(card, pos=None):
             pass
     st = d.get("status") or "—"
     if delay and delay >= 15:
-        st += f" (задержка {delay} мин)"
+        st += f" (задержка {_delay_text(delay)})"
     lines.append(f"Статус: {st}")
     extra = []
     if d.get("terminal"):
@@ -215,7 +320,7 @@ def describe_change(old, new, card):
         a, b = old.get(k), new.get(k)
         if a != b and b:
             if k in ("est", "actual"):
-                parts.append(f"{n}: {_hm(a)} → {_hm(b)}")
+                parts.append(f"{n}: {_hm(a, card.get('sched'))} → {_hm(b, card.get('sched'))}")
             else:
                 parts.append(f"{n}: {a or '—'} → {b}")
     return "; ".join(parts)

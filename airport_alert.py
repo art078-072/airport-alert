@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Монитор аэропортов Шереметьево, Внуково и Пулково.
+"""Монитор аэропортов Шереметьево, Внуково, Пулково и Сочи.
 
 Два типа событий:
   1. Закрытие / открытие — «временные ограничения на приём и выпуск воздушных судов»
@@ -32,13 +32,16 @@ MSK = timezone(timedelta(hours=3))
 UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"}
 
 # --- Закрытия -------------------------------------------------------------------------
-CHANNELS = ["svo_online", "vnukovoairport_VKO", "pulkovo_led", "favt_ru", "korenyako", "aeroflot"]
-AIRPORTS = ["Шереметьево", "Внуково", "Пулково"]
+CHANNELS = ["svo_online", "vnukovoairport_VKO", "pulkovo_led", "aeroaer", "favt_ru", "korenyako", "aeroflot"]
+# Собственные каналы аэропортов: их сообщение об ограничениях относится к своему аэропорту
+OWN_CHANNEL = {"svo_online": "Шереметьево", "vnukovoairport_VKO": "Внуково", "pulkovo_led": "Пулково", "aeroaer": "Сочи"}
+AIRPORTS = ["Шереметьево", "Внуково", "Пулково", "Сочи"]
 # Как аэропорт может упоминаться в тексте (в любом падеже)
 MENTION = {
     "Шереметьево": r"Шереметьев|московск\w+ авиа\w* узл|московских аэропорт|аэропортах Москвы",
     "Внуково": r"Внуков|московск\w+ авиа\w* узл|московских аэропорт|аэропортах Москвы",
     "Пулково": r"Пулков",
+    "Сочи": r"Сочи",
 }
 CLOSE_RE = re.compile(
     r"введен\w*\s+(временн\w+\s+)?ограничен|ограничен\w+\s+(на\s+)?(при[её]м|вылет|использован)"
@@ -110,9 +113,14 @@ def closure_status(posts):
         verdict = classify(p["text"])
         if not verdict:
             continue
-        for a in AIRPORTS:
-            if re.search(MENTION[a], p["text"]):
-                status[a] = {"state": verdict, "since": p["time"], "source": p["url"], "text": p["text"][:300]}
+        own = OWN_CHANNEL.get(p["channel"])
+        targets = [a for a in AIRPORTS if re.search(MENTION[a], p["text"])]
+        # В собственном канале аэропорта сообщение о своём аэропорте относится только к нему
+        # (чтобы «ограничения в Пулково; рейсы в Сочи задерживаются» не закрывало Сочи)
+        if own and own in targets:
+            targets = [own]
+        for a in targets:
+            status[a] = {"state": verdict, "since": p["time"], "source": p["url"], "text": p["text"][:300]}
     return status
 
 
@@ -157,7 +165,28 @@ def delayed_led():
     return {"delayed": len(delayed), "total": total, "flights": delayed[:15]}
 
 
-DELAY_SOURCES = {"Шереметьево": delayed_svo, "Пулково": delayed_led}
+def delayed_aer():
+    """Сочи: вылеты, у которых план или перенос попадает в окно, с задержкой >= DELAY_MIN."""
+    n = now_utc().astimezone(MSK)
+    lo, hi = n - timedelta(hours=WINDOW_BACK_H), n + timedelta(hours=WINDOW_FWD_H)
+    delayed, total = [], 0
+    for c in F.aer_board("today"):
+        if c["dir"] != "D" or not c.get("sched"):
+            continue
+        sched = datetime.fromisoformat(c["sched"])
+        ref = c.get("actual") or c.get("est")
+        est = datetime.fromisoformat(ref) if ref else None
+        if not (lo <= sched <= hi or (est and lo <= est <= hi)):
+            continue
+        if re.search(r"отмен", c.get("status", ""), re.I):
+            continue
+        total += 1
+        if est and est - sched >= timedelta(minutes=DELAY_MIN):
+            delayed.append(f"{c['flight']} {F._hm(c['sched'])}→{F._hm(ref, c['sched'])}")
+    return {"delayed": len(delayed), "total": total, "flights": delayed[:15]}
+
+
+DELAY_SOURCES = {"Шереметьево": delayed_svo, "Пулково": delayed_led, "Сочи": delayed_aer}
 
 
 # ======================================================================================
@@ -213,8 +242,8 @@ HELP = ("✈️ Отслеживание рейса:\n"
         "• /track SU284 21.09 — следить за рейсом: сообщу об изменении времени, статуса, выхода;\n"
         "• /my — мои рейсы, /untrack SU284 — перестать следить;\n"
         "• пришлите билет PDF или перешлите письмо с бронированием — поставлю все рейсы на слежение до прибытия.\n"
-        "Табло: Шереметьево и Пулково (Внуково не даёт данных). Ответ приходит в течение ~10 минут.")
-WELCOME = ("✅ Вы подписаны на оповещения по аэропортам Шереметьево, Внуково и Пулково:\n"
+        "Табло: Шереметьево, Пулково и Сочи (Внуково не даёт данных). Ответ приходит в течение ~10 минут.")
+WELCOME = ("✅ Вы подписаны на оповещения по аэропортам Шереметьево, Внуково, Пулково и Сочи:\n"
            "• закрытие / открытие (временные ограничения, обычно из-за атак беспилотников);\n"
            f"• массовые задержки — больше {DELAY_LIMIT} вылетов задержаны на {DELAY_MIN} мин и дольше.\n"
            "Сообщение приходит один раз при закрытии и один раз при открытии.\n"
@@ -244,7 +273,7 @@ def flight_reply(token, cid, code, num, date):
     if not cards:
         tg_api(token, "sendMessage", chat_id=cid,
                text=f"Рейс {code}{num} на {date.strftime('%d.%m')} не найден на табло Шереметьево и Пулково.\n"
-                    "Проверьте номер и дату (например «SU284 21.09»). Пулково показывает только ближайшие сутки."
+                    "Проверьте номер и дату (например «SU284 21.09»). Пулково и Сочи показывают только ближайшие сутки."
                     + (f"\n⚠️ {'; '.join(errs)}" if errs else ""))
         return []
     cards.sort(key=lambda c: c["dir"] != "D")
