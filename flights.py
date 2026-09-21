@@ -132,11 +132,23 @@ AER_ROW = re.compile(r'<a href="/flights/online-schedule/(\d+)/">\s*<div class="
                      r'((?:\s+data-[\w-]+="[^"]*")+)\s*(?:style="[^"]*")?>(.*?)</a>', re.S)
 
 
+_AER_CACHE = {}   # страница тяжёлая и медленная — грузим не чаще одного раза за запуск на каждый день
+
+
 def _aer_page(day):
+    if day in _AER_CACHE:
+        return _AER_CACHE[day]
     url = f"https://aer.aero/flights/online-schedule/?day_departure={day}&day_arrival={day}"
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=40) as r:
-        return r.read().decode("utf-8", "replace")
+    req = urllib.request.Request(url, headers={**UA, "Accept-Encoding": "gzip"})
+    import gzip, time
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=150) as r:
+        data = r.read()
+        if r.headers.get("Content-Encoding") == "gzip":
+            data = gzip.decompress(data)
+    _AER_CACHE[day] = data.decode("utf-8", "replace")
+    _AER_CACHE[day + "_time"] = round(time.time() - t0, 1)
+    return _AER_CACHE[day]
 
 
 def _aer_dt(text, fallback_date):
@@ -197,9 +209,12 @@ def parse_aer(page, page_date):
 
 def aer_board(day="today"):
     """Табло Сочи за день: 'yesterday' | 'today' | 'tomorrow'."""
+    if day + "_rows" in _AER_CACHE:
+        return _AER_CACHE[day + "_rows"]
     today = datetime.now(MSK).date()
     page_date = {"yesterday": today - timedelta(days=1), "today": today, "tomorrow": today + timedelta(days=1)}[day]
-    return parse_aer(_aer_page(day), page_date)
+    _AER_CACHE[day + "_rows"] = parse_aer(_aer_page(day), page_date)
+    return _AER_CACHE[day + "_rows"]
 
 
 def _aer(code, num, date):

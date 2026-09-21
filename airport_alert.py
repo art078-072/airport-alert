@@ -183,7 +183,7 @@ def delayed_aer():
         total += 1
         if est and est - sched >= timedelta(minutes=DELAY_MIN):
             delayed.append(f"{c['flight']} {F._hm(c['sched'])}→{F._hm(ref, c['sched'])}")
-    return {"delayed": len(delayed), "total": total, "flights": delayed[:15]}
+    return {"delayed": len(delayed), "total": total, "flights": delayed[:15], "fetch_s": F._AER_CACHE.get("today_time")}
 
 
 DELAY_SOURCES = {"Шереметьево": delayed_svo, "Пулково": delayed_led, "Сочи": delayed_aer}
