@@ -59,6 +59,9 @@ DELAY_MIN = 60        # задержка от ... минут
 DELAY_LIMIT = 5       # тревога, если задержанных рейсов БОЛЬШЕ этого числа
 DELAY_CLEAR = 3       # отбой, когда задержанных стало не больше этого числа (гистерезис от дребезга)
 WINDOW_BACK_H, WINDOW_FWD_H = 2, 6   # учитываем вылеты по расписанию от -2 ч до +6 ч от текущего момента
+CLOSURE_TTL_H = 8     # закрытие «живёт» не дольше N часов: без свежего подтверждения аэропорт снова считается
+                      # открытым. Ограничения длятся часы, а пост о снятии может не попасть в ленту канала —
+                      # без этого срока аэропорт навсегда застревал в статусе «закрыт» и уведомления не приходили.
 REMIND_MIN = 0        # повторные напоминания каждые N минут, пока ситуация сохраняется; 0 = выключено
                       # (по желанию пользователя: одно сообщение при закрытии, одно при открытии)
 
@@ -108,7 +111,8 @@ def classify(text):
 
 
 def closure_status(posts):
-    status = {a: {"state": "open", "since": None, "source": None, "text": None} for a in AIRPORTS}
+    status = {a: {"state": "open", "since": None, "source": None, "text": None, "stale": False} for a in AIRPORTS}
+    horizon = (now_utc() - timedelta(hours=CLOSURE_TTL_H)).isoformat()
     for p in sorted(posts, key=lambda p: p["time"]):
         verdict = classify(p["text"])
         if not verdict:
@@ -120,7 +124,12 @@ def closure_status(posts):
         if own and own in targets:
             targets = [own]
         for a in targets:
-            status[a] = {"state": verdict, "since": p["time"], "source": p["url"], "text": p["text"][:300]}
+            status[a] = {"state": verdict, "since": p["time"], "source": p["url"], "text": p["text"][:300],
+                         "stale": False}
+    # Устаревшее закрытие снимаем сами: пост о снятии мог не попасть в ленту канала
+    for a, s in status.items():
+        if s["state"] == "closed" and (s["since"] or "") < horizon:
+            s.update(state="open", stale=True)
     return status
 
 
@@ -596,6 +605,9 @@ def main():
         if cur["state"] != old:
             if cur["state"] == "closed":
                 line = f"🔴 ЗАКРЫТ: {a} — введены ограничения на приём и выпуск ({msk(cur['since'])})"
+            elif cur.get("stale"):
+                reminded.pop(f"closed:{a}", None)
+                continue   # закрытие протухло — тихо возвращаем «открыт», без сообщения
             else:
                 line = f"🟢 ОТКРЫТ: {a} — ограничения сняты ({msk(cur['since'])})"
             if cur.get("source"):
