@@ -259,7 +259,10 @@ WELCOME = ("✅ Вы подписаны на оповещения по аэро�
            f"• массовые задержки — больше {DELAY_LIMIT} вылетов задержаны на {DELAY_MIN} мин и дольше.\n"
            "Сообщение приходит один раз при закрытии и один раз при открытии.\n"
            "Отписаться: /stop\n\n" + HELP)
-BYE = "Вы отписаны от оповещений. Подписаться снова: /start"
+BYE = ("Вы отписаны от оповещений. Больше не пришлю ничего: ни о закрытии и открытии аэропортов, "
+       "ни о массовых задержках, ни об изменениях по вашим рейсам.\nПодписаться снова: /start")
+STOPPED_FLIGHT = ("Больше по этому рейсу сообщений не будет: ни об изменении времени вылета и прилёта, "
+                  "ни о статусе, терминале, выходе и ленте багажа.")
 
 
 def load_tracked():
@@ -332,7 +335,7 @@ def track_itinerary(token, cid, text, tracked, source="текст"):
     if added:
         msg += "👀 Слежу до прибытия: " + ", ".join(added) + ".\nСообщу об изменениях времени, статуса, выхода и багажа. /my — список, /untrack — отменить."
     if done:
-        msg += ("\n\n" if msg else "") + "✔️ Уже выполнены, следить не нужно: " + ", ".join(done) + "."
+        msg += ("\n\n" if msg else "") + "✔️ Уже выполнены, следить не нужно: " + ", ".join(done) + ".\n" + STOPPED_FLIGHT
     tg_api(token, "sendMessage", chat_id=cid, text=msg)
     return True
 
@@ -368,14 +371,18 @@ def handle_command(token, cid, text, subs, tracked):
         arg = t[8:].strip()
         mine = tracked.get(cid, {})
         if not arg:
-            tracked.pop(cid, None)
-            tg_api(token, "sendMessage", chat_id=cid, text="Перестал следить за всеми рейсами.")
+            had = bool(tracked.pop(cid, None))
+            tg_api(token, "sendMessage", chat_id=cid,
+                   text=("Перестал следить за всеми рейсами.\n" + STOPPED_FLIGHT.replace("этому рейсу", "этим рейсам")) if had
+                        else "Вы и так не следите ни за одним рейсом.")
             return True
         pf = F.parse_flight(arg)
         keys = [k for k in mine if pf and k.startswith(f"{pf[0]}{pf[1]}|")]
         for k in keys:
             mine.pop(k, None)
-        tg_api(token, "sendMessage", chat_id=cid, text="Перестал следить." if keys else "Такого рейса в списке нет. /my — список.")
+        tg_api(token, "sendMessage", chat_id=cid,
+               text=(f"Перестал следить за {pf[0]}{pf[1]}.\n" + STOPPED_FLIGHT) if keys
+                    else "Такого рейса в списке нет. /my — список.")
         return True
     if low.startswith("/track"):
         pf = F.parse_flight(t[6:].strip())
@@ -386,7 +393,8 @@ def handle_command(token, cid, text, subs, tracked):
         date = date or now_utc().astimezone(MSK).date()
         cards = flight_reply(token, cid, code, num, date)
         if cards and flight_done(cards):
-            tg_api(token, "sendMessage", chat_id=cid, text=f"✔️ {code}{num} {date.strftime('%d.%m')} уже выполнен — следить не нужно.")
+            tg_api(token, "sendMessage", chat_id=cid,
+                   text=f"✔️ {code}{num} {date.strftime('%d.%m')} уже выполнен — следить не нужно.\n" + STOPPED_FLIGHT)
             return True
         if cards:
             key = f"{code}{num}|{date}"
@@ -512,7 +520,7 @@ def check_tracked(token):
                 tg_api(token, "sendMessage", chat_id=cid,
                        text=f"✅ {code}{num} {date.strftime('%d.%m')} выполнен: {fin[0].get('status') or 'прибыл'}"
                             + (f" в {fin[0]['actual'][11:16]}" if fin[0].get("actual") and fin[0]["dir"] == "A" else "")
-                            + ". Снимаю с наблюдения.")
+                            + ". Снимаю с наблюдения.\n" + STOPPED_FLIGHT)
                 sent.append(f"{cid}: {code}{num} выполнен")
                 items.pop(key, None)
         if not items:
@@ -635,7 +643,9 @@ def main():
         elif was and d["delayed"] <= DELAY_CLEAR:
             delay_alert[a] = False
             reminded.pop(f"delay:{a}", None)
-            messages.append(f"🟢 ЗАДЕРЖКИ СНЯТЫ: {a} — задержанных на {DELAY_MIN}+ мин: {d['delayed']} ({stamp})")
+            messages.append(f"🟢 ЗАДЕРЖКИ СНЯТЫ: {a} — задержанных на {DELAY_MIN}+ мин: {d['delayed']} ({stamp}).\n"
+                            f"Про задержки в этом аэропорту больше не пишу — сообщу снова, только если задержанных "
+                            f"станет больше {DELAY_LIMIT}.")
         elif was and due(f"delay:{a}"):
             messages.append(f"🟠 НАПОМИНАНИЕ: {a} — задержки продолжаются: {d['delayed']} вылетов на {DELAY_MIN}+ мин "
                             f"(из {d['total']} ближайших, {stamp})\n" + ", ".join(d["flights"][:8]))
