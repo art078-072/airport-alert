@@ -226,16 +226,18 @@ def tg_config():
 
 
 def load_subs():
-    subs = {"offset": 0, "chats": {}}
+    subs = {"offset": 0, "chats": {}, "stopped": []}
     if os.path.exists(SUBS_FILE):
         try:
             subs.update(json.load(open(SUBS_FILE, encoding="utf-8")))
         except Exception:
             pass
-    # Начальные подписчики из переменной окружения (чтобы не терять их при переезде на другой сервер)
+    subs.setdefault("stopped", [])
+    # Начальные подписчики из переменной окружения (чтобы не терять их при переезде на другой сервер).
+    # Тех, кто сам отписался через /stop, не возвращаем — иначе отписка не работает.
     for cid in os.environ.get("TG_SEED_CHATS", "").replace(";", ",").split(","):
         cid = cid.strip()
-        if cid and cid not in subs["chats"]:
+        if cid and cid not in subs["chats"] and cid not in subs["stopped"]:
             subs["chats"][cid] = {"since": "seed"}
     return subs
 
@@ -448,10 +450,18 @@ def update_subscribers(token, subs):
             continue
         if low.startswith("/stop"):
             subs["chats"].pop(cid, None)
-            tracked.pop(cid, None)
-            tg_api(token, "sendMessage", chat_id=cid, text=BYE)
+            if cid not in subs.setdefault("stopped", []):
+                subs["stopped"].append(cid)
+            dropped = len(tracked.pop(cid, {}) or {})
+            text = BYE
+            if dropped:
+                text = (f"Снял с наблюдения рейсов: {dropped}. " + STOPPED_FLIGHT.replace("этому рейсу", "этим рейсам")
+                        + "\n\n" + BYE)
+            tg_api(token, "sendMessage", chat_id=cid, text=text)
             continue
         if cid not in subs["chats"]:
+            if cid in subs.get("stopped", []):
+                subs["stopped"].remove(cid)
             subs["chats"][cid] = {"since": now_utc().isoformat()}
             tg_api(token, "sendMessage", chat_id=cid, text=WELCOME)
             if low.startswith("/start"):
