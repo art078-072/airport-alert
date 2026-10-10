@@ -6,7 +6,7 @@
   Источник — официальные Telegram-каналы аэропортов (@svo_online, @vnukovoairport_VKO, @pulkovo_led),
   Росавиации (@favt_ru, @korenyako) и Аэрофлота (@aeroflot);
 - 🟠 массовые задержки — больше 5 вылетов задержаны на 60 минут и дольше
-  (онлайн-табло svo.aero, pulkovoairport.ru и aer.aero; табло Внуково закрыто от автоматического чтения).
+  (онлайн-табло svo.aero, pulkovoairport.ru и aer.aero; Внуково — через avionio.com, своё табло vnukovo.ru закрыто антибот-защитой).
 
 Проверка запускается GitHub Actions каждые 10 минут. Список подписчиков и состояние
 хранятся в кэше Actions (в репозитории только код).

@@ -1,7 +1,7 @@
 """Статус конкретного рейса и положение самолёта.
 
-Источники: онлайн-табло Шереметьево (svo.aero, вылет/прилёт, любые даты) и Пулково
-(pulkovoairport.ru, вылет/прилёт, ближайшие ~сутки); положение — ADS-B через api.adsb.lol
+Источники: онлайн-табло Шереметьево (svo.aero, вылет/прилёт, любые даты), Пулково
+(pulkovoairport.ru, вылет/прилёт, ближайшие ~сутки) и Внуково (avionio.com, ближайшие часы); положение — ADS-B через api.adsb.lol
 (бесплатно, без ключа; над Россией покрытие неполное, поэтому координаты есть не всегда).
 """
 import json, os, re, urllib.parse, urllib.request
@@ -243,10 +243,101 @@ def _aer(code, num, date):
     return found
 
 
+# ---------------------------------------------------------------------------------------
+# Внуково: собственное табло vnukovo.ru закрыто антибот-защитой, поэтому берём avionio.com —
+# готовый HTML-список вылетов/прилётов страницами по ~20 рейсов, начиная с момента ts
+# ---------------------------------------------------------------------------------------
+VKO_ROW = re.compile(r'<tr class="tt-row( tt-child)?\s*">(.*?)</tr>', re.S)
+_VKO_CACHE = {}   # url -> строки; одна страница грузится не чаще раза за запуск
+
+
+def _vko_page(direction, ts_ms, page):
+    url = f"https://www.avionio.com/ru/airport/vko/{direction}?ts={ts_ms}&page={page}"
+    if url not in _VKO_CACHE:
+        if _VKO_CACHE.get("failed"):
+            raise RuntimeError("avionio.com недоступен")
+        req = urllib.request.Request(url, headers={**UA, "Accept-Language": "ru"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                _VKO_CACHE[url] = parse_vko(r.read().decode("utf-8", "replace"), direction)
+        except Exception:
+            _VKO_CACHE["failed"] = True   # не повторять попытки в этом запуске
+            raise
+    return _VKO_CACHE[url]
+
+
+def parse_vko(page, direction):
+    dep = direction == "departures"
+    out = []
+    for child, row in VKO_ROW.findall(page):
+        m = re.search(r'data-ts="(\d+)"[^>]*>([A-Z0-9]{2}\d{1,4})</a>', row)
+        if not m:
+            continue
+        # data-ts — московское время, записанное как будто это UTC
+        sched = datetime.fromtimestamp(int(m.group(1)) / 1000, timezone.utc).replace(tzinfo=MSK)
+        cell = lambda c: re.sub(r"<[^>]+>|\s+", " ", (re.search(rf'class="{c}[^"]*">(.*?)</td>', row, re.S)
+                                                       or [None, ""])[1]).strip()
+        iata, city, airline = cell("tt-i"), cell("tt-ap"), re.sub(r"\s*\d+$", "", cell("tt-al"))
+        st = cell("tt-s")
+        est = actual = None
+        t = re.search(r"(\d\d):(\d\d)", st)
+        if t:
+            x = sched.replace(hour=int(t.group(1)), minute=int(t.group(2)))
+            if x < sched - timedelta(hours=12):      # перешло через полночь
+                x += timedelta(days=1)
+            if re.search(r"вылетел|приземл|прибыл", st, re.I):
+                actual = x.isoformat()
+            else:
+                est = x.isoformat()
+        out.append({
+            "airport": "Внуково", "iata_here": "VKO", "dir": "D" if dep else "A",
+            "flight": m.group(2), "airline": airline, "codeshare": bool(child),
+            "route": f"Москва (VKO) → {city} ({iata})" if dep else f"{city} ({iata}) → Москва (VKO)",
+            "sched": sched.isoformat(), "est": est, "actual": actual,
+            "status": re.sub(r"\s*\d\d:\d\d", "", st), "terminal": "", "gate": "", "belt": "", "aircraft": "",
+        })
+    return out
+
+
+def vko_board(direction, start, end, max_pages=6):
+    """Рейсы Внуково ('departures' | 'arrivals') с плановым временем в [start, end)."""
+    ts = int(start.astimezone(MSK).replace(tzinfo=timezone.utc).timestamp()) * 1000   # тот же сдвиг, что в data-ts
+    rows = []
+    for page in range(max_pages):
+        part = _vko_page(direction, ts, page)
+        if not part:
+            break
+        rows += part
+        if max(datetime.fromisoformat(c["sched"]) for c in part) >= end:
+            break
+    seen, out = set(), []
+    for c in rows:
+        k = (c["flight"], c["sched"])
+        if start <= datetime.fromisoformat(c["sched"]) < end and k not in seen:
+            seen.add(k)
+            out.append(c)
+    return out
+
+
+def _vko(code, num, date):
+    now = datetime.now(MSK)
+    day0 = datetime(date.year, date.month, date.day, tzinfo=MSK)
+    if abs((date - now.date()).days) > 1:
+        return []   # avionio показывает только ближайшие часы
+    start = max(day0, now - timedelta(hours=4))
+    end = min(day0 + timedelta(days=1), now + timedelta(hours=12))
+    if start >= end:
+        return []
+    found = []
+    for direction in ("departures", "arrivals"):
+        found += [c for c in vko_board(direction, start, end) if c["flight"] == f"{code}{num}"]
+    return found
+
+
 def find_flight(code, num, date):
     """Все записи табло по рейсу на дату (может быть 2: вылет из одного аэропорта и прилёт в другой)."""
     found, errors = [], []
-    for fn in (_svo, _led, _aer):
+    for fn in (_svo, _led, _vko, _aer):
         try:
             found += fn(code, num, date)
         except Exception as e:

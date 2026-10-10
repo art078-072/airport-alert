@@ -8,8 +8,8 @@
      и Аэрофлота (@aeroflot), читаются через публичные веб-превью t.me/s/<канал>.
   2. Массовые задержки — более DELAY_LIMIT вылетов задержаны на DELAY_MIN минут и больше.
   Сообщение отправляется один раз при изменении состояния (повторы отключены, REMIND_MIN = 0).
-     Источник — онлайн-табло svo.aero и pulkovoairport.ru (JSON). Табло Внуково защищено
-     от автоматического чтения, поэтому задержки по Внуково не отслеживаются.
+     Источник — онлайн-табло svo.aero и pulkovoairport.ru (JSON); для Внуково — avionio.com
+     (собственное табло vnukovo.ru закрыто антибот-защитой).
 
 Состояние хранится рядом со скриптом; при изменении рассылает сообщение подписчикам
 Telegram-бота (и SMS через sms.ru, если настроен). Печатает JSON-отчёт.
@@ -196,7 +196,20 @@ def delayed_aer():
     return {"delayed": len(delayed), "total": total, "flights": delayed[:15], "fetch_s": F._AER_CACHE.get("today_time")}
 
 
-DELAY_SOURCES = {"Шереметьево": delayed_svo, "Пулково": delayed_led}
+def delayed_vko():
+    n = now_utc().astimezone(MSK)
+    delayed, total = [], 0
+    for c in F.vko_board("departures", n - timedelta(hours=WINDOW_BACK_H), n + timedelta(hours=WINDOW_FWD_H)):
+        if c["codeshare"] or re.search(r"отмен", c["status"], re.I):
+            continue
+        total += 1
+        ref = c["actual"] or c["est"]
+        if ref and datetime.fromisoformat(ref) - datetime.fromisoformat(c["sched"]) >= timedelta(minutes=DELAY_MIN):
+            delayed.append(f"{c['flight']} {c['sched'][11:16]}→{F._hm(ref, c['sched'])}")
+    return {"delayed": len(delayed), "total": total, "flights": delayed[:15]}
+
+
+DELAY_SOURCES = {"Шереметьево": delayed_svo, "Внуково": delayed_vko, "Пулково": delayed_led}
 
 
 # ======================================================================================
@@ -254,7 +267,7 @@ HELP = ("✈️ Отслеживание рейса:\n"
         "• /track SU284 21.09 — следить за рейсом: сообщу об изменении времени, статуса, выхода;\n"
         "• /my — мои рейсы, /untrack SU284 — перестать следить;\n"
         "• пришлите билет PDF или перешлите письмо с бронированием — поставлю все рейсы на слежение до прибытия.\n"
-        "Табло: Шереметьево, Пулково и Сочи (Внуково не даёт данных). Ответ приходит в течение ~10 минут.")
+        "Табло: Шереметьево, Внуково и Пулково. Ответ приходит в течение ~10 минут.")
 WELCOME = ("✅ Вы подписаны на оповещения по аэропортам Шереметьево, Внуково и Пулково:\n"
            "• закрытие / открытие (временные ограничения, обычно из-за атак беспилотников);\n"
            f"• массовые задержки — больше {DELAY_LIMIT} вылетов задержаны на {DELAY_MIN} мин и дольше.\n"
@@ -288,7 +301,7 @@ def flight_reply(token, cid, code, num, date):
     if not cards:
         tg_api(token, "sendMessage", chat_id=cid,
                text=f"Рейс {code}{num} на {date.strftime('%d.%m')} не найден на табло Шереметьево и Пулково.\n"
-                    "Проверьте номер и дату (например «SU284 21.09»). Пулково и Сочи показывают только ближайшие сутки."
+                    "Проверьте номер и дату (например «SU284 21.09»). Пулково и Внуково показывают только ближайшие сутки."
                     + (f"\n⚠️ {'; '.join(errs)}" if errs else ""))
         return []
     cards.sort(key=lambda c: c["dir"] != "D")
