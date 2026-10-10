@@ -262,12 +262,12 @@ def save_subs(subs):
 
 
 HELP = ("✈️ Отслеживание рейса:\n"
-        "• пришлите номер рейса — «SU284» или «SU284 21.09» — получите статус с табло "
-        "(время, задержка, терминал, выход, лента багажа);\n"
-        "• /track SU284 21.09 — следить за рейсом: сообщу об изменении времени, статуса, выхода;\n"
-        "• /my — мои рейсы, /untrack SU284 — перестать следить;\n"
-        "• пришлите билет PDF или перешлите письмо с бронированием — поставлю все рейсы на слежение до прибытия.\n"
-        "Табло: Шереметьево, Внуково и Пулково. Ответ приходит в течение ~10 минут.")
+        "• пришлите номер рейса и дату — «SU284 21.09» (без даты — сегодня): покажу статус с табло "
+        "и сразу начну следить до прилёта — сообщу об изменении времени, статуса, выхода, ленты багажа;\n"
+        "• пришлите билет PDF или перешлите письмо с бронированием — поставлю все рейсы на слежение до прибытия;\n"
+        "• /my — мои рейсы, /untrack SU284 — перестать следить.\n"
+        "Табло: Шереметьево, Внуково, Пулково (подробно, с выходом и лентой) и любые другие аэропорты — "
+        "рейсы Аэрофлота из регионов тоже видны. Ответ приходит в течение ~10 минут.")
 WELCOME = ("✅ Вы подписаны на оповещения по аэропортам Шереметьево, Внуково и Пулково:\n"
            "• закрытие / открытие (временные ограничения, обычно из-за атак беспилотников);\n"
            f"• массовые задержки — больше {DELAY_LIMIT} вылетов задержаны на {DELAY_MIN} мин и дольше.\n"
@@ -295,22 +295,33 @@ def save_tracked(tr):
         open(TRACK_FILE, "w", encoding="utf-8").write(new)
 
 
-def flight_reply(token, cid, code, num, date):
-    """Карточки рейса (+ точка на карте, если есть координаты). Возвращает найденные карточки."""
-    cards, errs = F.find_flight(code, num, date)
-    if not cards:
-        tg_api(token, "sendMessage", chat_id=cid,
-               text=f"Рейс {code}{num} на {date.strftime('%d.%m')} не найден на табло Шереметьево и Пулково.\n"
-                    "Проверьте номер и дату (например «SU284 21.09»). Пулково и Внуково показывают только ближайшие сутки."
-                    + (f"\n⚠️ {'; '.join(errs)}" if errs else ""))
-        return []
-    cards.sort(key=lambda c: c["dir"] != "D")
-    pos = F.position(code, num) if POSITION_ENABLED and any(F.in_air(c) for c in cards) else None
-    text = "\n\n".join(F.format_card(c, pos if i == 0 else None) for i, c in enumerate(cards))
-    tg_api(token, "sendMessage", chat_id=cid, text=text)
-    if pos and pos.get("lat") is not None:
-        tg_api(token, "sendLocation", chat_id=cid, latitude=pos["lat"], longitude=pos["lon"])
-    return cards
+def start_tracking(token, cid, code, num, date, tracked):
+    """Номер рейса с датой: показать статус и сразу поставить на слежение до прилёта."""
+    today = now_utc().astimezone(MSK).date()
+    if date < today - timedelta(days=1):
+        tg_api(token, "sendMessage", chat_id=cid, text=f"{code}{num} {date.strftime('%d.%m.%Y')} — дата уже прошла, следить не за чем.")
+        return
+    cards, _ = F.find_flight(code, num, date)
+    if cards:
+        cards.sort(key=lambda c: c["dir"] != "D")
+        pos = F.position(code, num) if POSITION_ENABLED and any(F.in_air(c) for c in cards) else None
+        tg_api(token, "sendMessage", chat_id=cid, text="\n\n".join(F.format_card(c, pos if i == 0 else None) for i, c in enumerate(cards)))
+        if pos and pos.get("lat") is not None:
+            tg_api(token, "sendLocation", chat_id=cid, latitude=pos["lat"], longitude=pos["lon"])
+        if flight_done(cards):
+            tg_api(token, "sendMessage", chat_id=cid,
+                   text=f"✔️ {code}{num} {date.strftime('%d.%m')} уже выполнен — следить не нужно.\n" + STOPPED_FLIGHT)
+            return
+        head = f"👀 Слежу за {code}{num} {date.strftime('%d.%m')} до прилёта"
+    else:
+        head = (f"👀 {code}{num} {date.strftime('%d.%m.%Y')} пока нет на табло — слежу и сообщу, когда появится "
+                "(Шереметьево публикует рейсы заранее, остальные аэропорты — за несколько часов до вылета). "
+                "Если номер или дата с ошибкой, отмените: /untrack " + f"{code}{num}")
+    tracked.setdefault(cid, {})[f"{code}{num}|{date}"] = {
+        "last": {c["airport"] + c["dir"]: F.snapshot(c) for c in cards}, "added": now_utc().isoformat()}
+    tg_api(token, "sendMessage", chat_id=cid,
+           text=head + (": сообщу об изменениях времени, статуса, выхода и багажа. /untrack " + f"{code}{num} — отменить."
+                        if cards else ""))
 
 
 def flight_done(cards):
@@ -340,7 +351,7 @@ def track_itinerary(token, cid, text, tracked, source="текст"):
         else:
             tg_api(token, "sendMessage", chat_id=cid,
                    text=f"✈️ {code}{num} {date.strftime('%d.%m.%Y')} — пока нет на табло, сообщу, когда появится "
-                        "(Шереметьево публикует рейсы заранее, Пулково — за сутки).")
+                        "(Шереметьево публикует рейсы заранее, остальные аэропорты — за несколько часов до вылета).")
         key = f"{code}{num}|{date}"
         tracked.setdefault(cid, {})[key] = {"last": {c["airport"] + c["dir"]: F.snapshot(c) for c in cards},
                                             "added": now_utc().isoformat(), "source": source}
@@ -399,27 +410,11 @@ def handle_command(token, cid, text, subs, tracked):
                     else "Такого рейса в списке нет. /my — список.")
         return True
     if low.startswith("/track"):
-        pf = F.parse_flight(t[6:].strip())
-        if not pf:
-            tg_api(token, "sendMessage", chat_id=cid, text="Формат: /track SU284 21.09 (дата — необязательно, по умолчанию сегодня)")
-            return True
-        code, num, date = pf
-        date = date or now_utc().astimezone(MSK).date()
-        cards = flight_reply(token, cid, code, num, date)
-        if cards and flight_done(cards):
-            tg_api(token, "sendMessage", chat_id=cid,
-                   text=f"✔️ {code}{num} {date.strftime('%d.%m')} уже выполнен — следить не нужно.\n" + STOPPED_FLIGHT)
-            return True
-        if cards:
-            key = f"{code}{num}|{date}"
-            tracked.setdefault(cid, {})[key] = {"last": {c["airport"] + c["dir"]: F.snapshot(c) for c in cards},
-                                                "added": now_utc().isoformat()}
-            tg_api(token, "sendMessage", chat_id=cid, text=f"👀 Слежу за {code}{num} {date.strftime('%d.%m')}: сообщу об изменениях времени, статуса, выхода и багажа. /untrack {code}{num} — отменить.")
-        return True
+        t = t[6:].strip()
     pf = F.parse_flight(t)
     if pf:
         code, num, date = pf
-        flight_reply(token, cid, code, num, date or now_utc().astimezone(MSK).date())
+        start_tracking(token, cid, code, num, date or now_utc().astimezone(MSK).date(), tracked)
         return True
     # Пересланное бронирование / маршрут-квитанция / текст билета
     if track_itinerary(token, cid, t, tracked):

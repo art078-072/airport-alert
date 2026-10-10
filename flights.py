@@ -1,10 +1,11 @@
 """Статус конкретного рейса и положение самолёта.
 
 Источники: онлайн-табло Шереметьево (svo.aero, вылет/прилёт, любые даты), Пулково
-(pulkovoairport.ru, вылет/прилёт, ближайшие ~сутки) и Внуково (avionio.com, ближайшие часы); положение — ADS-B через api.adsb.lol
+(pulkovoairport.ru, вылет/прилёт, ближайшие ~сутки), Внуково и остальные аэропорты мира
+(avionio.com, ближайшие часы: так видны рейсы Аэрофлота из регионов); положение — ADS-B через api.adsb.lol
 (бесплатно, без ключа; над Россией покрытие неполное, поэтому координаты есть не всегда).
 """
-import json, os, re, urllib.parse, urllib.request
+import json, os, re, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
 
 MSK = timezone(timedelta(hours=3))
@@ -244,41 +245,56 @@ def _aer(code, num, date):
 
 
 # ---------------------------------------------------------------------------------------
-# Внуково: собственное табло vnukovo.ru закрыто антибот-защитой, поэтому берём avionio.com —
-# готовый HTML-список вылетов/прилётов страницами по ~20 рейсов, начиная с момента ts
+# avionio.com: табло любого аэропорта мира готовым HTML, страницами по ~20 рейсов от момента ts.
+# Нужно для Внуково (vnukovo.ru закрыт антибот-защитой) и для рейсов из аэропортов, у которых нет
+# своего источника, — прежде всего Аэрофлота: aeroflot.ru пускает только живой браузер с российского IP.
+# Время везде местное для аэропорта; avionio записывает его в data-ts так, будто это UTC.
 # ---------------------------------------------------------------------------------------
-VKO_ROW = re.compile(r'<tr class="tt-row( tt-child)?\s*">(.*?)</tr>', re.S)
-_VKO_CACHE = {}   # url -> строки; одна страница грузится не чаще раза за запуск
+AV_ROW = re.compile(r'<tr class="tt-row( tt-child)?\s*">(.*?)</tr>', re.S)
+_AV_CACHE = {}   # url -> разобранная страница; одна страница грузится не чаще раза за запуск
+OWN_BOARDS = {"SVO", "LED", "VKO"}   # у этих аэропортов табло читается отдельно и подробнее
 
 
-def _vko_page(direction, ts_ms, page):
-    url = f"https://www.avionio.com/ru/airport/vko/{direction}?ts={ts_ms}&page={page}"
-    if url not in _VKO_CACHE:
-        if _VKO_CACHE.get("failed"):
+def _av_get(url):
+    if url not in _AV_CACHE:
+        if _AV_CACHE.get("failed"):
             raise RuntimeError("avionio.com недоступен")
         req = urllib.request.Request(url, headers={**UA, "Accept-Language": "ru"})
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
-                _VKO_CACHE[url] = parse_vko(r.read().decode("utf-8", "replace"), direction)
-        except Exception:
-            _VKO_CACHE["failed"] = True   # не повторять попытки в этом запуске
+                _AV_CACHE[url] = r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                _AV_CACHE["failed"] = True
             raise
-    return _VKO_CACHE[url]
+        except Exception:
+            _AV_CACHE["failed"] = True   # не повторять попытки в этом запуске
+            raise
+    return _AV_CACHE[url]
 
 
-def parse_vko(page, direction):
+def _local_ts(dt):
+    """Местное время аэропорта -> ts в понимании avionio."""
+    return int(dt.replace(tzinfo=timezone.utc).timestamp()) * 1000
+
+
+def _cell(row, cls):
+    m = re.search(rf'class="{cls}[^"]*">(.*?)</td>', row, re.S)
+    return re.sub(r"<[^>]+>|\s+", " ", m.group(1) if m else "").strip()
+
+
+def parse_board(page, iata, direction, name, tz=None):
+    """Строки табло -> карточки. tz задан — время с поясом (Внуково), иначе местное без пояса."""
     dep = direction == "departures"
+    here = f"{name} ({iata})"
     out = []
-    for child, row in VKO_ROW.findall(page):
+    for child, row in AV_ROW.findall(page):
         m = re.search(r'data-ts="(\d+)"[^>]*>([A-Z0-9]{2}\d{1,4})</a>', row)
         if not m:
             continue
-        # data-ts — московское время, записанное как будто это UTC
-        sched = datetime.fromtimestamp(int(m.group(1)) / 1000, timezone.utc).replace(tzinfo=MSK)
-        cell = lambda c: re.sub(r"<[^>]+>|\s+", " ", (re.search(rf'class="{c}[^"]*">(.*?)</td>', row, re.S)
-                                                       or [None, ""])[1]).strip()
-        iata, city, airline = cell("tt-i"), cell("tt-ap"), re.sub(r"\s*\d+$", "", cell("tt-al"))
-        st = cell("tt-s")
+        sched = datetime.fromtimestamp(int(m.group(1)) / 1000, timezone.utc).replace(tzinfo=tz)
+        other, city = _cell(row, "tt-i"), _cell(row, "tt-ap")
+        st = _cell(row, "tt-s")
         est = actual = None
         t = re.search(r"(\d\d):(\d\d)", st)
         if t:
@@ -290,21 +306,22 @@ def parse_vko(page, direction):
             else:
                 est = x.isoformat()
         out.append({
-            "airport": "Внуково", "iata_here": "VKO", "dir": "D" if dep else "A",
-            "flight": m.group(2), "airline": airline, "codeshare": bool(child),
-            "route": f"Москва (VKO) → {city} ({iata})" if dep else f"{city} ({iata}) → Москва (VKO)",
+            "airport": name, "iata_here": iata, "dir": "D" if dep else "A",
+            "flight": m.group(2), "airline": re.sub(r"\s*\d+$", "", _cell(row, "tt-al")), "codeshare": bool(child),
+            "route": f"{here} → {city} ({other})" if dep else f"{city} ({other}) → {here}",
             "sched": sched.isoformat(), "est": est, "actual": actual,
             "status": re.sub(r"\s*\d\d:\d\d", "", st), "terminal": "", "gate": "", "belt": "", "aircraft": "",
         })
     return out
 
 
-def vko_board(direction, start, end, max_pages=6):
-    """Рейсы Внуково ('departures' | 'arrivals') с плановым временем в [start, end)."""
-    ts = int(start.astimezone(MSK).replace(tzinfo=timezone.utc).timestamp()) * 1000   # тот же сдвиг, что в data-ts
+def av_board(iata, direction, start, end, name, tz=None, max_pages=6):
+    """Рейсы аэропорта ('departures' | 'arrivals') с плановым временем в [start, end)."""
+    ts = _local_ts(start.astimezone(tz).replace(tzinfo=None) if tz else start)
     rows = []
     for page in range(max_pages):
-        part = _vko_page(direction, ts, page)
+        part = parse_board(_av_get(f"https://www.avionio.com/ru/airport/{iata.lower()}/{direction}?ts={ts}&page={page}"),
+                           iata, direction, name, tz)
         if not part:
             break
         rows += part
@@ -319,6 +336,10 @@ def vko_board(direction, start, end, max_pages=6):
     return out
 
 
+def vko_board(direction, start, end, max_pages=6):
+    return av_board("VKO", direction, start, end, "Москва", MSK, max_pages)
+
+
 def _vko(code, num, date):
     now = datetime.now(MSK)
     day0 = datetime(date.year, date.month, date.day, tzinfo=MSK)
@@ -331,13 +352,62 @@ def _vko(code, num, date):
     found = []
     for direction in ("departures", "arrivals"):
         found += [c for c in vko_board(direction, start, end) if c["flight"] == f"{code}{num}"]
+    for c in found:
+        c["airport"] = "Внуково"
     return found
+
+
+def flight_route(code, num, date):
+    """Маршрут рейса по истории avionio: [(откуда, город, ЧЧ:ММ вылета, куда, город, ЧЧ:ММ прилёта)].
+    Берём строки на нужную дату, а если её ещё нет — самую свежую дату (расписание обычно то же)."""
+    try:
+        page = _av_get(f"https://www.avionio.com/ru/flight/{code.lower()}-{num}")
+    except urllib.error.HTTPError:
+        return []
+    i = page.find("История рейса")
+    rows = re.findall(r'<tr class="tt-row f-row">(.*?)</tr>', page[i:], re.S) if i >= 0 else []
+    legs = {}
+    for r in rows:
+        m = re.search(r'data-ts="(\d+)"', r)
+        fd = re.search(r'class="tt-fd">\s*(\d\d:\d\d)\s*<a[^>]*>([A-Z]{3})</a>\s*([^<]*)', r)
+        fa = re.search(r'class="tt-fa">\s*(\d\d:\d\d)\s*<a[^>]*>([A-Z]{3})</a>\s*([^<]*)', r)
+        if not (m and fd and fa):
+            continue
+        d = datetime.fromtimestamp(int(m.group(1)) / 1000, timezone.utc).date()
+        legs.setdefault(d, []).append((fd.group(2), fd.group(3).strip(), fd.group(1),
+                                       fa.group(2), fa.group(3).strip(), fa.group(1)))
+    if not legs:
+        return []
+    return legs.get(date) or legs[max(legs)]
+
+
+def _avionio(code, num, date):
+    """Любой рейс (в первую очередь Аэрофлот) по табло аэропортов вылета и прилёта, кроме своих табло."""
+    if abs((date - datetime.now(MSK).date()).days) > 1:
+        return []   # табло avionio покрывают только ближайшие часы
+    out = []
+    for org, org_city, dep_t, dst, dst_city, arr_t in flight_route(code, num, date):
+        dep = datetime.combine(date, datetime.strptime(dep_t, "%H:%M").time())
+        arr = datetime.combine(date, datetime.strptime(arr_t, "%H:%M").time())
+        if arr < dep - timedelta(hours=6):       # прилёт на следующий день по местному времени
+            arr += timedelta(days=1)
+        for iata, city, direction, t in ((org, org_city, "departures", dep), (dst, dst_city, "arrivals", arr)):
+            if iata in OWN_BOARDS or (iata == "AER" and AER_AVAILABLE):
+                continue
+            # расписание на дату могло сдвинуться — ищем в окне ±4 ч от времени из истории
+            hits = [c for c in av_board(iata, direction, t - timedelta(hours=4), t + timedelta(hours=4), city, max_pages=4)
+                    if c["flight"] == f"{code}{num}"]
+            if hits:   # табло иногда дублирует рейс с разным временем — берём ближайший к расписанию
+                c = min(hits, key=lambda c: abs(datetime.fromisoformat(c["sched"]) - t))
+                c["airport"] = city
+                out.append(c)
+    return out
 
 
 def find_flight(code, num, date):
     """Все записи табло по рейсу на дату (может быть 2: вылет из одного аэропорта и прилёт в другой)."""
     found, errors = [], []
-    for fn in (_svo, _led, _vko, _aer):
+    for fn in (_svo, _led, _vko, _aer, _avionio):
         try:
             found += fn(code, num, date)
         except Exception as e:
