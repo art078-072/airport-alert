@@ -295,33 +295,37 @@ def save_tracked(tr):
         open(TRACK_FILE, "w", encoding="utf-8").write(new)
 
 
+def confirm_text(code, num, date):
+    """Первая строка ответа на номер рейса или билет."""
+    return f"✈️ Отслеживаю рейс {code}{num}, дата {date.strftime('%d.%m.%Y')}"
+
+
+NOT_ON_BOARD = ("Рейса пока нет на табло — сообщу, когда появится "
+                "(Шереметьево публикует рейсы заранее, остальные аэропорты — за несколько часов до вылета).")
+
+
 def start_tracking(token, cid, code, num, date, tracked):
-    """Номер рейса с датой: показать статус и сразу поставить на слежение до прилёта."""
+    """Номер рейса с датой: сразу поставить на слежение до прилёта и показать статус."""
     today = now_utc().astimezone(MSK).date()
     if date < today - timedelta(days=1):
         tg_api(token, "sendMessage", chat_id=cid, text=f"{code}{num} {date.strftime('%d.%m.%Y')} — дата уже прошла, следить не за чем.")
         return
     cards, _ = F.find_flight(code, num, date)
-    if cards:
-        cards.sort(key=lambda c: c["dir"] != "D")
-        pos = F.position(code, num) if POSITION_ENABLED and any(F.in_air(c) for c in cards) else None
-        tg_api(token, "sendMessage", chat_id=cid, text="\n\n".join(F.format_card(c, pos if i == 0 else None) for i, c in enumerate(cards)))
-        if pos and pos.get("lat") is not None:
-            tg_api(token, "sendLocation", chat_id=cid, latitude=pos["lat"], longitude=pos["lon"])
-        if flight_done(cards):
-            tg_api(token, "sendMessage", chat_id=cid,
-                   text=f"✔️ {code}{num} {date.strftime('%d.%m')} уже выполнен — следить не нужно.\n" + STOPPED_FLIGHT)
-            return
-        head = f"👀 Отслеживаю рейс {code}{num} за {date.strftime('%d.%m.%Y')} до прилёта"
-    else:
-        head = (f"👀 Отслеживаю рейс {code}{num} за {date.strftime('%d.%m.%Y')}. Его пока нет на табло — сообщу, когда появится "
-                "(Шереметьево публикует рейсы заранее, остальные аэропорты — за несколько часов до вылета). "
-                "Если номер или дата с ошибкой, отмените: /untrack " + f"{code}{num}")
+    cards.sort(key=lambda c: c["dir"] != "D")
+    if cards and flight_done(cards):
+        tg_api(token, "sendMessage", chat_id=cid, text="\n\n".join(F.format_card(c) for c in cards))
+        tg_api(token, "sendMessage", chat_id=cid,
+               text=f"✔️ {code}{num} {date.strftime('%d.%m')} уже выполнен — следить не нужно.\n" + STOPPED_FLIGHT)
+        return
     tracked.setdefault(cid, {})[f"{code}{num}|{date}"] = {
         "last": {c["airport"] + c["dir"]: F.snapshot(c) for c in cards}, "added": now_utc().isoformat()}
+    pos = F.position(code, num) if cards and POSITION_ENABLED and any(F.in_air(c) for c in cards) else None
+    body = ("\n\n".join(F.format_card(c, pos if i == 0 else None) for i, c in enumerate(cards)) if cards else NOT_ON_BOARD)
     tg_api(token, "sendMessage", chat_id=cid,
-           text=head + (": сообщу об изменениях времени, статуса, выхода и багажа. /untrack " + f"{code}{num} — отменить."
-                        if cards else ""))
+           text=f"{confirm_text(code, num, date)}\n\n{body}\n\nДо прилёта сообщу об изменениях времени, статуса, выхода и багажа. "
+                f"/untrack {code}{num} — отменить.")
+    if pos and pos.get("lat") is not None:
+        tg_api(token, "sendLocation", chat_id=cid, latitude=pos["lat"], longitude=pos["lon"])
 
 
 def flight_done(cards):
@@ -342,28 +346,20 @@ def track_itinerary(token, cid, text, tracked, source="текст"):
     added, done = [], []
     for code, num, date in found[:8]:
         cards, _ = F.find_flight(code, num, date)
-        name = f"{code}{num} за {date.strftime('%d.%m.%Y')}"
-        if cards:
-            cards.sort(key=lambda c: c["dir"] != "D")
-            if flight_done(cards):
-                tg_api(token, "sendMessage", chat_id=cid, text="\n\n".join(F.format_card(c) for c in cards))
-                done.append(name)
-                continue
-            tg_api(token, "sendMessage", chat_id=cid,
-                   text=f"👀 Отслеживаю рейс {name}\n\n" + "\n\n".join(F.format_card(c) for c in cards))
-        else:
-            tg_api(token, "sendMessage", chat_id=cid,
-                   text=f"👀 Отслеживаю рейс {name}. Его пока нет на табло — сообщу, когда появится "
-                        "(Шереметьево публикует рейсы заранее, остальные аэропорты — за несколько часов до вылета).")
+        cards.sort(key=lambda c: c["dir"] != "D")
+        if cards and flight_done(cards):
+            tg_api(token, "sendMessage", chat_id=cid, text="\n\n".join(F.format_card(c) for c in cards))
+            done.append(f"{code}{num} {date.strftime('%d.%m.%Y')}")
+            continue
+        body = "\n\n".join(F.format_card(c) for c in cards) if cards else NOT_ON_BOARD
+        tg_api(token, "sendMessage", chat_id=cid, text=f"{confirm_text(code, num, date)}\n\n{body}")
         key = f"{code}{num}|{date}"
         tracked.setdefault(cid, {})[key] = {"last": {c["airport"] + c["dir"]: F.snapshot(c) for c in cards},
                                             "added": now_utc().isoformat(), "source": source}
-        added.append(name)
+        added.append(key)
     msg = ""
     if added:
-        msg += ("До прибытия сообщу об изменениях времени, статуса, выхода и багажа. /my — список, /untrack — отменить."
-                if len(added) == 1 else
-                "Отслеживаю рейсы: " + ", ".join(added) + ".\nДо прибытия сообщу об изменениях времени, статуса, выхода и багажа. /my — список, /untrack — отменить.")
+        msg += "До прибытия сообщу об изменениях времени, статуса, выхода и багажа. /my — список, /untrack — отменить."
     if done:
         msg += ("\n\n" if msg else "") + "✔️ Уже выполнены, следить не нужно: " + ", ".join(done) + ".\n" + STOPPED_FLIGHT
     tg_api(token, "sendMessage", chat_id=cid, text=msg)
