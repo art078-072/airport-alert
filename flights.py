@@ -542,12 +542,27 @@ def _parse_date(m, year_hint):
         return None
 
 
+# дата рядом с этими словами — дата оформления билета, а не вылета (у Аэрофлота она стоит сразу за рейсом)
+ISSUE_RE = re.compile(r"КВИТАНЦ|ВЫДАЧИ|ОФОРМЛЕН\S* \d|ДАТА ПОКУПКИ|ISSUED|ISSUE DATE|DATE OF ISSUE")
+# перед номером рейса: тип самолёта (A320 → «A3 20»), код брони, рейс-партнёр по код-шерингу
+AIRCRAFT_RE = re.compile(r"AIRBUS|BOEING|SUPERJET|SSJ|EMBRAER|BOMBARDIER|ATR|ТИП ВС|AIRCRAFT|САМОЛ[ЕЁ]Т")
+PNR_RE = re.compile(r"БРОНИРОВ|BOOKING|PNR|RESERVATION|№ ?ЗАКАЗА")
+OPERATED_RE = re.compile(r"ВЫПОЛНЯЕТСЯ|OPERATED")
+
+
+def _ctx(up, a, b):
+    return re.sub(r"\s+", " ", up[max(a, 0):b])
+
+
 def parse_itinerary(text, today):
-    """Находит пары (рейс, дата) в свободном тексте: каждому рейсу — ближайшая по тексту дата.
-    Возвращает список (code, num, date), без дублей, только даты не раньше вчера."""
+    """Находит пары (рейс, дата) в свободном тексте: каждому рейсу — ближайшая по тексту дата вылета
+    (дату оформления билета пропускает). Возвращает список (code, num, date), без дублей, только даты не раньше вчера."""
     up = text.upper()
-    dates = [(m.start(), _parse_date(m, today.year)) for m in DATE_RE.finditer(text)]
-    dates = [(p, d) for p, d in dates if d]
+    dates = []
+    for m in DATE_RE.finditer(text):
+        d = _parse_date(m, today.year)
+        if d and not ISSUE_RE.search(_ctx(up, m.end(), m.end() + 60) + " " + _ctx(up, m.start() - 40, m.start())):
+            dates.append((m.start(), d))
     out, seen = [], set()
     for m in FLIGHT_RE.finditer(up):
         code, num = m.group(1), m.group(2).lstrip("0")
@@ -556,13 +571,16 @@ def parse_itinerary(text, today):
         # только известные авиакомпании либо код с цифрой (U6, S7, 5N ...) — чтобы не ловить «ряд 12» и т.п.
         if code not in ICAO and not re.search(r"\d", code):
             continue
+        before_txt = _ctx(up, m.start() - 40, m.start())
+        if AIRCRAFT_RE.search(_ctx(up, m.start() - 25, m.start())) or OPERATED_RE.search(_ctx(up, m.start() - 60, m.start())):
+            continue
+        if code not in ICAO and PNR_RE.search(before_txt):
+            continue
         if not dates:
             continue
         pos = m.start()
-        # ближайшая дата после рейса в пределах 300 символов, иначе ближайшая до
-        after = [(p - pos, d) for p, d in dates if p >= pos and p - pos < 300]
-        before = [(pos - p, d) for p, d in dates if p < pos]
-        cand = min(after)[1] if after else (min(before)[1] if before else None)
+        near = [(abs(p - pos), d) for p, d in dates if abs(p - pos) < 400]
+        cand = min(near)[1] if near else None
         if not cand or cand < today - timedelta(days=1):
             continue
         key = (code, num, cand)

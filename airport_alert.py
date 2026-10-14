@@ -312,9 +312,9 @@ def start_tracking(token, cid, code, num, date, tracked):
             tg_api(token, "sendMessage", chat_id=cid,
                    text=f"✔️ {code}{num} {date.strftime('%d.%m')} уже выполнен — следить не нужно.\n" + STOPPED_FLIGHT)
             return
-        head = f"👀 Слежу за {code}{num} {date.strftime('%d.%m')} до прилёта"
+        head = f"👀 Отслеживаю рейс {code}{num} за {date.strftime('%d.%m.%Y')} до прилёта"
     else:
-        head = (f"👀 {code}{num} {date.strftime('%d.%m.%Y')} пока нет на табло — слежу и сообщу, когда появится "
+        head = (f"👀 Отслеживаю рейс {code}{num} за {date.strftime('%d.%m.%Y')}. Его пока нет на табло — сообщу, когда появится "
                 "(Шереметьево публикует рейсы заранее, остальные аэропорты — за несколько часов до вылета). "
                 "Если номер или дата с ошибкой, отмените: /untrack " + f"{code}{num}")
     tracked.setdefault(cid, {})[f"{code}{num}|{date}"] = {
@@ -342,23 +342,28 @@ def track_itinerary(token, cid, text, tracked, source="текст"):
     added, done = [], []
     for code, num, date in found[:8]:
         cards, _ = F.find_flight(code, num, date)
+        name = f"{code}{num} за {date.strftime('%d.%m.%Y')}"
         if cards:
             cards.sort(key=lambda c: c["dir"] != "D")
-            tg_api(token, "sendMessage", chat_id=cid, text="\n\n".join(F.format_card(c) for c in cards))
             if flight_done(cards):
-                done.append(f"{code}{num} {date.strftime('%d.%m')}")
+                tg_api(token, "sendMessage", chat_id=cid, text="\n\n".join(F.format_card(c) for c in cards))
+                done.append(name)
                 continue
+            tg_api(token, "sendMessage", chat_id=cid,
+                   text=f"👀 Отслеживаю рейс {name}\n\n" + "\n\n".join(F.format_card(c) for c in cards))
         else:
             tg_api(token, "sendMessage", chat_id=cid,
-                   text=f"✈️ {code}{num} {date.strftime('%d.%m.%Y')} — пока нет на табло, сообщу, когда появится "
+                   text=f"👀 Отслеживаю рейс {name}. Его пока нет на табло — сообщу, когда появится "
                         "(Шереметьево публикует рейсы заранее, остальные аэропорты — за несколько часов до вылета).")
         key = f"{code}{num}|{date}"
         tracked.setdefault(cid, {})[key] = {"last": {c["airport"] + c["dir"]: F.snapshot(c) for c in cards},
                                             "added": now_utc().isoformat(), "source": source}
-        added.append(f"{code}{num} {date.strftime('%d.%m')}")
+        added.append(name)
     msg = ""
     if added:
-        msg += "👀 Слежу до прибытия: " + ", ".join(added) + ".\nСообщу об изменениях времени, статуса, выхода и багажа. /my — список, /untrack — отменить."
+        msg += ("До прибытия сообщу об изменениях времени, статуса, выхода и багажа. /my — список, /untrack — отменить."
+                if len(added) == 1 else
+                "Отслеживаю рейсы: " + ", ".join(added) + ".\nДо прибытия сообщу об изменениях времени, статуса, выхода и багажа. /my — список, /untrack — отменить.")
     if done:
         msg += ("\n\n" if msg else "") + "✔️ Уже выполнены, следить не нужно: " + ", ".join(done) + ".\n" + STOPPED_FLIGHT
     tg_api(token, "sendMessage", chat_id=cid, text=msg)
