@@ -409,13 +409,27 @@ def ensure_ocr():
                    shell=True, check=True, timeout=300, stdout=subprocess.DEVNULL)
 
 
+OCR_MAX_PER_RUN = 5          # больше фото за один запуск не распознаём, чтобы не задерживать оповещения
+OCR_MAX_PIXELS = 40_000_000  # защита от «бомбы» — картинки огромного размера
+_ocr_count = 0
+
+
 def ocr_image(data):
     """Распознаёт билет на фото или скриншоте. Мелкий шрифт квитанции читается лучше после увеличения
     в 2–3 раза; если при 2× рейс не нашёлся, пробует 3×."""
     import io, subprocess, tempfile
     from PIL import Image, ImageOps
+    global _ocr_count
+    _ocr_count += 1
+    if _ocr_count > OCR_MAX_PER_RUN:
+        raise RuntimeError("слишком много снимков сразу — пришлите остальные через 10 минут")
+    Image.MAX_IMAGE_PIXELS = OCR_MAX_PIXELS   # больше — Pillow откажется открывать
     ensure_ocr()
-    im = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+    im = Image.open(io.BytesIO(data))
+    if im.width * im.height > OCR_MAX_PIXELS:
+        raise RuntimeError("слишком большое изображение")
+    im = ImageOps.exif_transpose(im)
+    im.thumbnail((4000, 4000))
     im = ImageOps.autocontrast(ImageOps.grayscale(im))
     today = now_utc().astimezone(MSK).date()
     text = ""
