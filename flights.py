@@ -522,22 +522,26 @@ MONTHS = {"янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "ма
           "окт": 10, "ноя": 11, "дек": 12, "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7,
           "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
 FLIGHT_RE = re.compile(r"(?<![A-Z0-9])([A-Z][A-Z0-9]|[0-9][A-Z])\s?-?\s?(\d{2,4})(?![0-9])")
-DATE_RE = re.compile(r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})|(\d{1,2})\s+([а-яА-Яa-zA-Z]{3,8})\.?\s*(\d{4})?")
+DATE_RE = re.compile(r"(?<![\d.,])(\d{1,2})[./](\d{1,2})(?:[./](\d{4}|\d{2}(?!\d)))?(?![\d.,]\d)|(\d{1,2})\s+([а-яА-Яa-zA-Z]{3,8})\.?\s*(\d{4})?")
 # слова, после которых двухбуквенные сочетания — не авиакомпании (терминал, выход, ряд и т.п.)
 NOISE = {"PNR", "ID", "NO", "ОК", "OK", "RU", "EN", "UP", "GB", "US", "KG", "PC", "PS"}
 
 
-def _parse_date(m, year_hint):
+def _parse_date(m, today):
+    """Дата из совпадения DATE_RE; без года — ближайшая будущая (21.10 в декабре — это октябрь следующего года)."""
     if m.group(1):
         d, mo, y = int(m.group(1)), int(m.group(2)), m.group(3)
-        y = int(y) + 2000 if len(y) == 2 else int(y)
+        y = (int(y) + 2000 if len(y) == 2 else int(y)) if y else None
     else:
         d, mon, y = int(m.group(4)), m.group(5).lower()[:3], m.group(6)
         if mon not in MONTHS:
             return None
-        mo, y = MONTHS[mon], int(y) if y else year_hint
+        mo, y = MONTHS[mon], int(y) if y else None
     try:
-        return datetime(y, mo, d).date()
+        if y:
+            return datetime(y, mo, d).date()
+        dt = datetime(today.year, mo, d).date()
+        return dt if dt >= today - timedelta(days=60) else datetime(today.year + 1, mo, d).date()
     except ValueError:
         return None
 
@@ -560,10 +564,10 @@ def parse_itinerary(text, today):
     up = text.upper()
     dates = []
     for m in DATE_RE.finditer(text):
-        d = _parse_date(m, today.year)
+        d = _parse_date(m, today)
         if d and not ISSUE_RE.search(_ctx(up, m.end(), m.end() + 60) + " " + _ctx(up, m.start() - 40, m.start())):
-            dates.append((m.start(), d))
-    out, seen = [], set()
+            dates.append((m.start(), d, m.end()))
+    out, seen, operated = [], set(), []
     for m in FLIGHT_RE.finditer(up):
         code, num = m.group(1), m.group(2).lstrip("0")
         if code in NOISE or not num or code.isdigit():
@@ -572,19 +576,49 @@ def parse_itinerary(text, today):
         if code not in ICAO and not re.search(r"\d", code):
             continue
         before_txt = _ctx(up, m.start() - 40, m.start())
-        if AIRCRAFT_RE.search(_ctx(up, m.start() - 25, m.start())) or OPERATED_RE.search(_ctx(up, m.start() - 60, m.start())):
+        # код рейса пишут заглавными; «3a 20 мин» из распознанного «за 20 мин» — не рейс
+        if text[m.start():m.start() + 2] != code:
             continue
+        if AIRCRAFT_RE.search(_ctx(up, m.start() - 25, m.start())):
+            continue
+        is_operated = bool(OPERATED_RE.search(_ctx(up, m.start() - 60, m.start())))
         if code not in ICAO and PNR_RE.search(before_txt):
             continue
         if not dates:
             continue
         pos = m.start()
-        near = [(abs(p - pos), d) for p, d in dates if abs(p - pos) < 400]
-        cand = min(near)[1] if near else None
-        if not cand or cand < today - timedelta(days=1):
+        near = [(abs(p - pos), d, p, e) for p, d, e in dates if abs(p - pos) < 400]
+        if not near:
+            continue
+        _, cand, cp, ce = min(near)
+        # вплотную стоят даты вылета и прилёта (порядок зависит от вёрстки) — берём более раннюю, это вылет
+        cand = min([cand] + [d for p, d, e in dates if not text[ce:p].strip(" \n") and 0 <= p - ce <= 2
+                                     or not text[e:cp].strip(" \n") and 0 <= cp - e <= 2])
+        if cand < today - timedelta(days=1):
             continue
         key = (code, num, cand)
         if key not in seen:
             seen.add(key)
-            out.append(key)
-    return out
+            (operated if is_operated else out).append(key)
+    # рейс партнёра («выполняется авиакомпанией Россия, FV6441») — только если основной номер не нашёлся
+    return out or operated
+
+
+# строка расчёта тарифа: «LED SU SGC» — перевозчик между кодами аэропортов
+FARE_CARRIER_RE = re.compile(r"\b[A-Z]{3} ([A-Z][A-Z0-9]|[0-9][A-Z]) [A-Z]{3}\b")
+
+
+def fix_ocr(text):
+    """Подчищает распознанный с фото текст: «Рейс: $ 6441» → «Рейс: SU 6441» (код перевозчика — из строки тарифа)."""
+    up = text.upper()
+    m = FARE_CARRIER_RE.search(up)
+    carrier = m.group(1) if m and m.group(1) in ICAO else ("SU" if "АЭРОФЛОТ" in up or "AEROFLOT" in up else None)
+    if not carrier:
+        return text
+
+    def sub(mm):
+        code = (mm.group(2) or "").strip().upper()
+        if re.fullmatch(r"[A-Z][A-Z0-9]|[0-9][A-Z]", code) and (code in ICAO or re.search(r"\d", code)):
+            return mm.group(0)
+        return f"{mm.group(1)}{carrier} {mm.group(3)}"
+    return re.sub(r"(Рейс:?\s*|Flight:?\s*)(\S{1,3}\s?)?(\d{3,4})\b", sub, text, flags=re.I)

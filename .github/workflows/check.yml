@@ -32,7 +32,7 @@ jobs:
           restore-keys: state-
 
       - name: Зависимости
-        run: pip install -q pypdf
+        run: pip install -q pypdf pillow
 
       - name: Проверка аэропортов и рассылка
         env:

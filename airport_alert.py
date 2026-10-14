@@ -264,7 +264,7 @@ def save_subs(subs):
 HELP = ("✈️ Отслеживание рейса:\n"
         "• пришлите номер рейса и дату — «SU284 21.09» (без даты — сегодня): покажу статус с табло "
         "и сразу начну следить до прилёта — сообщу об изменении времени, статуса, выхода, ленты багажа;\n"
-        "• пришлите билет PDF или перешлите письмо с бронированием — поставлю все рейсы на слежение до прибытия;\n"
+        "• пришлите билет — PDF, фото или скриншот — или перешлите письмо с бронированием: поставлю все рейсы на слежение до прибытия;\n"
         "• /my — мои рейсы, /untrack SU284 — перестать следить.\n"
         "Табло: Шереметьево, Внуково, Пулково (подробно, с выходом и лентой) и любые другие аэропорты — "
         "рейсы Аэрофлота из регионов тоже видны. Ответ приходит в течение ~10 минут.")
@@ -370,18 +370,66 @@ def track_itinerary(token, cid, text, tracked, source="текст"):
     return True
 
 
-def pdf_text(token, file_id):
-    """Скачивает документ из Telegram и извлекает текст (PDF)."""
+def tg_file(token, file_id):
+    """Скачивает файл, присланный боту (до 20 МБ — ограничение Telegram Bot API)."""
     info = tg_api(token, "getFile", file_id=file_id)
     if not info.get("ok"):
         raise RuntimeError("не удалось получить файл из Telegram")
     url = f"https://api.telegram.org/file/bot{token}/{info['result']['file_path']}"
     with urllib.request.urlopen(url, timeout=60) as r:
-        data = r.read()
+        return r.read()
+
+
+def pdf_text(data):
+    """Текстовый слой PDF; если его нет (скан) — распознаёт страницы как картинки."""
     import io
     from pypdf import PdfReader
     reader = PdfReader(io.BytesIO(data))
-    return "\n".join((page.extract_text() or "") for page in reader.pages)
+    txt = "\n".join((page.extract_text() or "") for page in reader.pages)
+    if txt.strip():
+        return txt
+    import subprocess, tempfile
+    ensure_ocr()
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "t.pdf"), "wb").write(data)
+        subprocess.run(["pdftoppm", "-r", "200", "-png", "-l", "4", os.path.join(d, "t.pdf"), os.path.join(d, "p")],
+                       check=True, timeout=120)
+        pages = sorted(f for f in os.listdir(d) if f.endswith(".png"))
+        return "\n".join(ocr_image(open(os.path.join(d, f), "rb").read()) for f in pages)
+
+
+def ensure_ocr():
+    """Tesseract с русским ставится только когда пришло фото: на раннере GitHub это ~30 с, а нужно редко."""
+    import shutil, subprocess
+    if shutil.which("tesseract") and shutil.which("pdftoppm"):
+        langs = subprocess.run(["tesseract", "--list-langs"], capture_output=True, text=True).stdout
+        if "rus" in langs.split():
+            return
+    subprocess.run("sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-rus poppler-utils",
+                   shell=True, check=True, timeout=300, stdout=subprocess.DEVNULL)
+
+
+def ocr_image(data):
+    """Распознаёт билет на фото или скриншоте. Мелкий шрифт квитанции читается лучше после увеличения
+    в 2–3 раза; если при 2× рейс не нашёлся, пробует 3×."""
+    import io, subprocess, tempfile
+    from PIL import Image, ImageOps
+    ensure_ocr()
+    im = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+    im = ImageOps.autocontrast(ImageOps.grayscale(im))
+    today = now_utc().astimezone(MSK).date()
+    text = ""
+    for scale in (2, 3):
+        k = min(scale, max(1, 4000 // max(im.width, im.height)))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.png")
+            im.resize((im.width * k, im.height * k), Image.LANCZOS).save(path)
+            out = subprocess.run(["tesseract", path, "stdout", "-l", "rus+eng"],
+                                 capture_output=True, text=True, timeout=180).stdout
+        text = F.fix_ocr(out)
+        if F.parse_itinerary(text, today - timedelta(days=3650)) or k < scale:
+            break
+    return text
 
 
 def handle_command(token, cid, text, subs, tracked):
@@ -443,22 +491,32 @@ def update_subscribers(token, subs):
         text = (m.get("text") or m.get("caption") or "").strip()
         low = text.lower()
         doc = m.get("document") or {}
-        if doc and (doc.get("mime_type") == "application/pdf" or str(doc.get("file_name", "")).lower().endswith(".pdf")):
+        dname = str(doc.get("file_name", "")).lower()
+        is_pdf = doc.get("mime_type") == "application/pdf" or dname.endswith(".pdf")
+        is_img = str(doc.get("mime_type", "")).startswith("image/") or dname.endswith((".jpg", ".jpeg", ".png", ".webp"))
+        photo = (m.get("photo") or [None])[-1]   # самый крупный размер
+        if is_pdf or is_img or photo:
             if cid not in subs["chats"]:
                 subs["chats"][cid] = {"since": now_utc().isoformat()}
+            kind = "PDF" if is_pdf else "фото"
             try:
-                if doc.get("file_size", 0) > 20 * 1024 * 1024:
+                f = doc if (is_pdf or is_img) else photo
+                if f.get("file_size", 0) > 20 * 1024 * 1024:
                     raise RuntimeError("файл больше 20 МБ")
-                txt = pdf_text(token, doc["file_id"])
-                if not txt.strip():
-                    raise RuntimeError("в PDF нет текстового слоя (скан?) — пришлите текст бронирования")
-                if not track_itinerary(token, cid, txt, tracked, source=doc.get("file_name", "pdf")):
-                    tg_api(token, "sendMessage", chat_id=cid, text="В PDF не нашёл рейсов с датами. Пришлите номер рейса и дату текстом, например «SU284 21.09».")
+                data = tg_file(token, f["file_id"])
+                txt = pdf_text(data) if is_pdf else ocr_image(data)
+                # подпись к фото («SU284 21.10») тоже учитываем
+                txt = (text + "\n" + txt) if text else txt
+                if not track_itinerary(token, cid, txt, tracked, source=doc.get("file_name") or kind):
+                    tg_api(token, "sendMessage", chat_id=cid,
+                           text=f"На {kind} не нашёл номера рейса с датой. Пришлите их текстом, например «SU284 21.09», "
+                                "или более чёткий снимок/скриншот маршрутной квитанции.")
             except Exception as e:
-                tg_api(token, "sendMessage", chat_id=cid, text=f"Не удалось разобрать PDF: {e}")
+                tg_api(token, "sendMessage", chat_id=cid, text=f"Не удалось разобрать {kind}: {e}")
             continue
-        if doc or m.get("photo"):
-            tg_api(token, "sendMessage", chat_id=cid, text="Принимаю билеты в PDF или текстом (перешлите письмо с бронированием). Фото пока не распознаю.")
+        if doc:
+            tg_api(token, "sendMessage", chat_id=cid,
+                   text="Принимаю билеты в PDF, фото или скриншотом, либо текстом (перешлите письмо с бронированием).")
             continue
         if low.startswith("/stop"):
             subs["chats"].pop(cid, None)
