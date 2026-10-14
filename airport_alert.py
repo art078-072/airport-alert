@@ -380,7 +380,7 @@ def tg_file(token, file_id):
         return r.read()
 
 
-def pdf_text(data):
+def pdf_text(data, cid=None):
     """Текстовый слой PDF; если его нет (скан) — распознаёт страницы как картинки."""
     import io
     from pypdf import PdfReader
@@ -395,7 +395,7 @@ def pdf_text(data):
         subprocess.run(["pdftoppm", "-r", "200", "-png", "-l", "4", os.path.join(d, "t.pdf"), os.path.join(d, "p")],
                        check=True, timeout=120)
         pages = sorted(f for f in os.listdir(d) if f.endswith(".png"))
-        return "\n".join(ocr_image(open(os.path.join(d, f), "rb").read()) for f in pages)
+        return "\n".join(ocr_image(open(os.path.join(d, f), "rb").read(), cid) for f in pages)
 
 
 def ensure_ocr():
@@ -409,19 +409,22 @@ def ensure_ocr():
                    shell=True, check=True, timeout=300, stdout=subprocess.DEVNULL)
 
 
-OCR_MAX_PER_RUN = 5          # больше фото за один запуск не распознаём, чтобы не задерживать оповещения
+OCR_MAX_PER_RUN = 12         # всего снимков за запуск — чтобы не задерживать оповещения
+OCR_MAX_PER_CHAT = 3         # от одного отправителя за запуск — чтобы один не занял очередь остальных
 OCR_MAX_PIXELS = 40_000_000  # защита от «бомбы» — картинки огромного размера
 _ocr_count = 0
+_ocr_by_chat = {}
 
 
-def ocr_image(data):
+def ocr_image(data, cid=None):
     """Распознаёт билет на фото или скриншоте. Мелкий шрифт квитанции читается лучше после увеличения
     в 2–3 раза; если при 2× рейс не нашёлся, пробует 3×."""
     import io, subprocess, tempfile
     from PIL import Image, ImageOps
     global _ocr_count
     _ocr_count += 1
-    if _ocr_count > OCR_MAX_PER_RUN:
+    _ocr_by_chat[cid] = _ocr_by_chat.get(cid, 0) + 1
+    if _ocr_count > OCR_MAX_PER_RUN or _ocr_by_chat[cid] > OCR_MAX_PER_CHAT:
         raise RuntimeError("слишком много снимков сразу — пришлите остальные через 10 минут")
     Image.MAX_IMAGE_PIXELS = OCR_MAX_PIXELS   # больше — Pillow откажется открывать
     ensure_ocr()
@@ -518,7 +521,7 @@ def update_subscribers(token, subs):
                 if f.get("file_size", 0) > 20 * 1024 * 1024:
                     raise RuntimeError("файл больше 20 МБ")
                 data = tg_file(token, f["file_id"])
-                txt = pdf_text(data) if is_pdf else ocr_image(data)
+                txt = pdf_text(data, cid) if is_pdf else ocr_image(data, cid)
                 # подпись к фото («SU284 21.10») тоже учитываем
                 txt = (text + "\n" + txt) if text else txt
                 if not track_itinerary(token, cid, txt, tracked, source=doc.get("file_name") or kind):
